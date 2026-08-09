@@ -102,7 +102,22 @@ class Simulator:
         self, program: Program, feeds: Mapping[str, np.ndarray]
     ) -> tuple[np.ndarray, SimulationReport]:
         validated_feeds = self._validate_feeds(program, feeds)
-        output = np.empty(program.output_shape, dtype=program.output_dtype)
+        memory: dict[str, np.ndarray] = dict(validated_feeds)
+        memory.update(
+            {
+                name: np.asarray(value).copy()
+                for name, value in program.constants.items()
+            }
+        )
+        value_types = dict(program.value_types)
+        if not value_types:
+            value_types[program.output_name] = (
+                program.output_shape,
+                program.output_dtype,
+            )
+        for name, (shape, dtype) in value_types.items():
+            if name not in memory:
+                memory[name] = np.empty(shape, dtype=dtype)
         buffers: dict[str, np.ndarray] = {}
         instruction_counts: Counter[str] = Counter()
         cycles_by_opcode: Counter[str] = Counter()
@@ -115,7 +130,7 @@ class Simulator:
         for index, instruction in enumerate(program.instructions):
             instruction_counts[instruction.opcode.value] += 1
             cycles, read, written = self._execute(
-                instruction, validated_feeds, output, buffers
+                instruction, memory, buffers
             )
             cycles_by_opcode[instruction.opcode.value] += cycles
             timeline.append(
@@ -146,28 +161,25 @@ class Simulator:
             peak_sram_bytes,
             tuple(timeline),
         )
-        return output, report
+        return memory[program.output_name], report
 
     def _execute(
         self,
         instruction: Instruction,
-        feeds: Mapping[str, np.ndarray],
-        output: np.ndarray,
+        memory: dict[str, np.ndarray],
         buffers: dict[str, np.ndarray],
     ) -> tuple[int, int, int]:
         operands = instruction.operands
 
         if instruction.opcode is Opcode.ZERO:
-            buffer = np.zeros(operands["shape"], dtype=output.dtype)
+            buffer = np.zeros(operands["shape"], dtype=np.float32)
             buffers[operands["buffer"]] = buffer
             cycles = ceil(buffer.size / self.hardware.macs_per_cycle)
             return cycles, 0, 0
 
         if instruction.opcode is Opcode.DMA_LOAD:
-            source = feeds[operands["source"]]
-            row, column = operands["offset"]
-            rows, columns = operands["shape"]
-            tile = source[row : row + rows, column : column + columns].copy()
+            source = memory[operands["source"]]
+            tile = _read_tile(source, operands["offset"], operands["shape"])
             buffers[operands["buffer"]] = tile
             cycles = ceil(tile.nbytes / self.hardware.dma_bytes_per_cycle)
             return cycles, tile.nbytes, 0
@@ -180,12 +192,29 @@ class Simulator:
             macs = lhs.shape[0] * rhs.shape[1] * lhs.shape[1]
             return ceil(macs / self.hardware.macs_per_cycle), 0, 0
 
+        if instruction.opcode is Opcode.ADD:
+            result = buffers[operands["lhs"]] + buffers[operands["rhs"]]
+            buffers[operands["output"]] = np.asarray(result, dtype=np.float32)
+            cycles = ceil(result.size / self.hardware.macs_per_cycle)
+            return cycles, 0, 0
+
+        if instruction.opcode is Opcode.RELU:
+            source = buffers[operands["input"]]
+            result = np.maximum(source, 0)
+            buffers[operands["output"]] = result
+            cycles = ceil(result.size / self.hardware.macs_per_cycle)
+            return cycles, 0, 0
+
         if instruction.opcode is Opcode.DMA_STORE:
             tile = buffers[operands["buffer"]]
-            row, column = operands["offset"]
-            rows, columns = operands["shape"]
-            output[row : row + rows, column : column + columns] = tile
+            _write_tile(
+                memory[operands["output"]],
+                operands["offset"],
+                operands["shape"],
+                tile,
+            )
             cycles = ceil(tile.nbytes / self.hardware.dma_bytes_per_cycle)
+            buffers.clear()
             return cycles, 0, tile.nbytes
 
         raise ValueError(f"unsupported opcode: {instruction.opcode}")
@@ -214,3 +243,31 @@ class Simulator:
                 )
             validated[name] = value
         return validated
+
+
+def _read_tile(
+    source: np.ndarray,
+    offset: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> np.ndarray:
+    if not shape:
+        return source.copy()
+    slices = tuple(
+        slice(start, start + extent) for start, extent in zip(offset, shape)
+    )
+    return source[slices].copy()
+
+
+def _write_tile(
+    target: np.ndarray,
+    offset: tuple[int, ...],
+    shape: tuple[int, ...],
+    tile: np.ndarray,
+) -> None:
+    if not shape:
+        target[...] = tile
+        return
+    slices = tuple(
+        slice(start, start + extent) for start, extent in zip(offset, shape)
+    )
+    target[slices] = tile

@@ -13,6 +13,8 @@ class Opcode(str, Enum):
     ZERO = "ZERO"
     DMA_LOAD = "DMA_LOAD"
     MATMUL = "MATMUL"
+    ADD = "ADD"
+    RELU = "RELU"
     DMA_STORE = "DMA_STORE"
 
 
@@ -33,10 +35,13 @@ class Program:
     output_name: str
     output_shape: tuple[int, ...]
     output_dtype: np.dtype
+    value_types: Mapping[str, tuple[tuple[int, ...], np.dtype]] = field(
+        default_factory=dict
+    )
+    constants: Mapping[str, np.ndarray] = field(default_factory=dict)
 
     def __str__(self) -> str:
         return "\n".join(
             f"{index:04d}: {instruction}"
             for index, instruction in enumerate(self.instructions)
         )
-

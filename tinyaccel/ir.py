@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import re
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
 
 _IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
-_TENSOR_TYPE_SYNTAX = r"tensor<\d+(?:x\d+)*x[A-Za-z][A-Za-z0-9_]*>"
+_TENSOR_TYPE_SYNTAX = r"tensor<(?:\d+x)*[A-Za-z][A-Za-z0-9_]*>"
 _TENSOR_TYPE_PATTERN = re.compile(
-    r"tensor<(?P<shape>\d+(?:x\d+)*)x(?P<dtype>[A-Za-z][A-Za-z0-9_]*)>"
+    r"tensor<(?:(?P<shape>\d+(?:x\d+)*)x)?"
+    r"(?P<dtype>[A-Za-z][A-Za-z0-9_]*)>"
 )
 
 
@@ -25,14 +27,16 @@ class TensorType:
 
     def __post_init__(self) -> None:
         shape = tuple(self.shape)
-        if not shape or any(not isinstance(dim, int) or dim <= 0 for dim in shape):
+        if any(not isinstance(dim, int) or dim <= 0 for dim in shape):
             raise ValueError(f"tensor dimensions must be positive integers, got {shape}")
         object.__setattr__(self, "shape", shape)
         object.__setattr__(self, "dtype", np.dtype(self.dtype))
 
     def __str__(self) -> str:
-        dims = "x".join(str(dim) for dim in self.shape)
-        return f"tensor<{dims}x{self.dtype.name}>"
+        prefix = "x".join(str(dim) for dim in self.shape)
+        if prefix:
+            prefix += "x"
+        return f"tensor<{prefix}{self.dtype.name}>"
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,11 @@ class Operation:
     op: str
     inputs: tuple[Value, ...]
     output: Value
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "inputs", tuple(self.inputs))
+        object.__setattr__(self, "attributes", dict(self.attributes))
 
 
 class Graph:
@@ -67,11 +76,15 @@ class Graph:
         self.inputs = tuple(inputs)
         self.operations = tuple(operations)
         self.outputs = tuple(outputs)
+        self._producers: dict[Value, Operation] = {}
+        self._users: dict[Value, list[Operation]] = {}
         self.validate()
+        for operation in self.operations:
+            self._producers[operation.output] = operation
+            for value in set(operation.inputs):
+                self._users.setdefault(value, []).append(operation)
 
     def validate(self) -> None:
-        if not self.inputs:
-            raise ValueError("graph must have at least one input")
         if not self.outputs:
             raise ValueError("graph must have at least one output")
 
@@ -82,6 +95,8 @@ class Graph:
             defined[value.name] = value
 
         for operation in self.operations:
+            if re.fullmatch(_IDENTIFIER, operation.op) is None:
+                raise ValueError(f"invalid operation name: {operation.op!r}")
             for value in operation.inputs:
                 if defined.get(value.name) != value:
                     raise ValueError(f"use of undefined value: %{value.name}")
@@ -93,13 +108,24 @@ class Graph:
             if defined.get(value.name) != value:
                 raise ValueError(f"undefined graph output: %{value.name}")
 
+    @property
+    def values(self) -> tuple[Value, ...]:
+        return self.inputs + tuple(operation.output for operation in self.operations)
+
+    def producer(self, value: Value) -> Operation | None:
+        return self._producers.get(value)
+
+    def users(self, value: Value) -> tuple[Operation, ...]:
+        return tuple(self._users.get(value, ()))
+
     def __str__(self) -> str:
         arguments = ", ".join(f"{value}: {value.type}" for value in self.inputs)
         lines = [f"graph ({arguments}) {{"]
         for operation in self.operations:
             operands = ", ".join(str(value) for value in operation.inputs)
+            attributes = _format_attributes(operation.attributes)
             lines.append(
-                f"  {operation.output} = {operation.op}({operands}) : "
+                f"  {operation.output} = {operation.op}({operands}){attributes} : "
                 f"{operation.output.type}"
             )
         outputs = ", ".join(str(value) for value in self.outputs)
@@ -112,6 +138,25 @@ class Graph:
         """Parse the canonical text produced by :meth:`__str__`."""
 
         return parse_graph(text)
+
+    def to_dot(self) -> str:
+        """Return a dependency graph in GraphViz DOT format."""
+
+        output_values = set(self.outputs)
+        lines = ["digraph TinyAccel {", "  rankdir=LR;"]
+        for value in self.values:
+            shape = "doublecircle" if value in output_values else "ellipse"
+            lines.append(
+                f'  value_{value.name} [label="%{value.name}\\n{value.type}", '
+                f"shape={shape}];"
+            )
+        for index, operation in enumerate(self.operations):
+            lines.append(f'  op_{index} [label="{operation.op}", shape=box];')
+            for value in operation.inputs:
+                lines.append(f"  value_{value.name} -> op_{index};")
+            lines.append(f"  op_{index} -> value_{operation.output.name};")
+        lines.append("}")
+        return "\n".join(lines)
 
 
 class GraphBuilder:
@@ -134,9 +179,24 @@ class GraphBuilder:
         self._inputs.append(value)
         return value
 
+    def constant(
+        self,
+        value: Any,
+        *,
+        dtype: str | np.dtype | None = None,
+        name: str | None = None,
+    ) -> Value:
+        array = np.asarray(value, dtype=dtype)
+        if array.dtype.kind not in "biuf":
+            raise ValueError(f"unsupported constant dtype: {array.dtype}")
+        output = self._new_output(name, TensorType(array.shape, array.dtype))
+        self._operations.append(
+            Operation("constant", (), output, {"value": array.copy()})
+        )
+        return output
+
     def matmul(self, lhs: Value, rhs: Value, name: str | None = None) -> Value:
-        self._require_defined(lhs)
-        self._require_defined(rhs)
+        self._require_defined(lhs, rhs)
         if len(lhs.type.shape) != 2 or len(rhs.type.shape) != 2:
             raise ValueError("matmul currently requires rank-2 tensors")
         if lhs.type.shape[1] != rhs.type.shape[0]:
@@ -144,23 +204,78 @@ class GraphBuilder:
                 "matmul dimension mismatch: "
                 f"{lhs.type.shape} cannot be multiplied by {rhs.type.shape}"
             )
-        if lhs.type.dtype != rhs.type.dtype:
-            raise ValueError(
-                f"matmul dtype mismatch: {lhs.type.dtype} and {rhs.type.dtype}"
-            )
-
-        output_name = name or self._fresh_name()
-        self._reserve_name(output_name)
-        output = Value(
-            output_name,
+        self._require_same_dtype("matmul", lhs, rhs)
+        output = self._new_output(
+            name,
             TensorType((lhs.type.shape[0], rhs.type.shape[1]), lhs.type.dtype),
         )
         self._operations.append(Operation("matmul", (lhs, rhs), output))
         return output
 
+    def add(self, lhs: Value, rhs: Value, name: str | None = None) -> Value:
+        self._require_defined(lhs, rhs)
+        self._require_same_dtype("add", lhs, rhs)
+        try:
+            shape = np.broadcast_shapes(lhs.type.shape, rhs.type.shape)
+        except ValueError as error:
+            raise ValueError(
+                f"add shapes are not broadcastable: {lhs.type.shape} and "
+                f"{rhs.type.shape}"
+            ) from error
+        output = self._new_output(name, TensorType(shape, lhs.type.dtype))
+        self._operations.append(Operation("add", (lhs, rhs), output))
+        return output
+
+    def relu(self, value: Value, name: str | None = None) -> Value:
+        self._require_defined(value)
+        output = self._new_output(name, value.type)
+        self._operations.append(Operation("relu", (value,), output))
+        return output
+
+    def matmul_bias_relu(
+        self,
+        lhs: Value,
+        rhs: Value,
+        bias: Value,
+        name: str | None = None,
+    ) -> Value:
+        """Build the canonical fused MatMul + bias + ReLU operation."""
+
+        self._require_defined(lhs, rhs, bias)
+        if len(lhs.type.shape) != 2 or len(rhs.type.shape) != 2:
+            raise ValueError("matmul_bias_relu requires rank-2 matmul inputs")
+        if lhs.type.shape[1] != rhs.type.shape[0]:
+            raise ValueError(
+                "matmul_bias_relu dimension mismatch: "
+                f"{lhs.type.shape} cannot be multiplied by {rhs.type.shape}"
+            )
+        self._require_same_dtype("matmul_bias_relu", lhs, rhs)
+        self._require_same_dtype("matmul_bias_relu", lhs, bias)
+        matmul_shape = (lhs.type.shape[0], rhs.type.shape[1])
+        try:
+            output_shape = np.broadcast_shapes(matmul_shape, bias.type.shape)
+        except ValueError as error:
+            raise ValueError(
+                f"bias shape {bias.type.shape} cannot broadcast to {matmul_shape}"
+            ) from error
+        if output_shape != matmul_shape:
+            raise ValueError(
+                f"bias shape {bias.type.shape} expands matmul output {matmul_shape}"
+            )
+        output = self._new_output(name, TensorType(matmul_shape, lhs.type.dtype))
+        self._operations.append(
+            Operation("matmul_bias_relu", (lhs, rhs, bias), output)
+        )
+        return output
+
     def build(self, outputs: Value | Iterable[Value]) -> Graph:
         graph_outputs = (outputs,) if isinstance(outputs, Value) else tuple(outputs)
         return Graph(self._inputs, self._operations, graph_outputs)
+
+    def _new_output(self, name: str | None, tensor_type: TensorType) -> Value:
+        output_name = name or self._fresh_name()
+        self._reserve_name(output_name)
+        return Value(output_name, tensor_type)
 
     def _fresh_name(self) -> str:
         while True:
@@ -176,19 +291,22 @@ class GraphBuilder:
             raise ValueError(f"duplicate value name: %{name}")
         self._names.add(name)
 
-    def _require_defined(self, value: Value) -> None:
+    def _require_defined(self, *values: Value) -> None:
         known_values = self._inputs + [op.output for op in self._operations]
-        if value not in known_values:
-            raise ValueError(f"value {value} does not belong to this builder")
+        for value in values:
+            if value not in known_values:
+                raise ValueError(f"value {value} does not belong to this builder")
+
+    @staticmethod
+    def _require_same_dtype(op: str, lhs: Value, rhs: Value) -> None:
+        if lhs.type.dtype != rhs.type.dtype:
+            raise ValueError(
+                f"{op} dtype mismatch: {lhs.type.dtype} and {rhs.type.dtype}"
+            )
 
 
 def parse_graph(text: str) -> Graph:
-    """Parse TinyAccel's canonical graph IR.
-
-    The v0.1 grammar intentionally accepts only the operations understood by
-    :class:`GraphBuilder`. This keeps parsing, inference, and validation on one
-    path instead of trusting type annotations embedded in the input text.
-    """
+    """Parse canonical TinyAccel graph IR and re-run type inference."""
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if len(lines) < 3:
@@ -215,15 +333,15 @@ def parse_graph(text: str) -> Graph:
 
     for line_number, line in enumerate(lines[1:-2], start=2):
         match = re.fullmatch(
-            rf"%({_IDENTIFIER})\s*=\s*({_IDENTIFIER})\(([^)]*)\)\s*:\s*"
-            rf"({_TENSOR_TYPE_SYNTAX})",
+            rf"%({_IDENTIFIER})\s*=\s*({_IDENTIFIER})\(([^)]*)\)"
+            rf"(?:\s+(\{{.*\}}))?\s*:\s*({_TENSOR_TYPE_SYNTAX})",
             line,
         )
         if match is None:
             raise ValueError(f"invalid operation on line {line_number}: {line!r}")
-        output_name, op_name, operand_text, type_text = match.groups()
+        output_name, op_name, operand_text, attribute_text, type_text = match.groups()
         operand_names = _parse_value_references(
-            operand_text, f"operation on line {line_number}"
+            operand_text, f"operation on line {line_number}", allow_empty=True
         )
         try:
             operands = [values[name] for name in operand_names]
@@ -231,16 +349,35 @@ def parse_graph(text: str) -> Graph:
             raise ValueError(
                 f"undefined operand %{error.args[0]} on line {line_number}"
             ) from error
+        attributes = _parse_attributes(attribute_text, line_number)
+        declared_type = _parse_tensor_type(type_text)
 
-        if op_name == "matmul" and len(operands) == 2:
+        if op_name == "constant" and not operands:
+            if set(attributes) != {"value"}:
+                raise ValueError("constant requires exactly one 'value' attribute")
+            result = builder.constant(
+                attributes["value"], dtype=declared_type.dtype, name=output_name
+            )
+        elif op_name == "matmul" and len(operands) == 2 and not attributes:
             result = builder.matmul(operands[0], operands[1], name=output_name)
+        elif op_name == "add" and len(operands) == 2 and not attributes:
+            result = builder.add(operands[0], operands[1], name=output_name)
+        elif op_name == "relu" and len(operands) == 1 and not attributes:
+            result = builder.relu(operands[0], name=output_name)
+        elif (
+            op_name == "matmul_bias_relu"
+            and len(operands) == 3
+            and not attributes
+        ):
+            result = builder.matmul_bias_relu(
+                operands[0], operands[1], operands[2], name=output_name
+            )
         else:
             raise ValueError(
                 f"unsupported operation {op_name!r} with {len(operands)} operands "
                 f"on line {line_number}"
             )
 
-        declared_type = _parse_tensor_type(type_text)
         if result.type != declared_type:
             raise ValueError(
                 f"declared type {declared_type} does not match inferred type "
@@ -263,7 +400,10 @@ def _parse_tensor_type(text: str) -> TensorType:
     match = _TENSOR_TYPE_PATTERN.fullmatch(text)
     if match is None:
         raise ValueError(f"invalid tensor type: {text!r}")
-    shape = tuple(int(dimension) for dimension in match.group("shape").split("x"))
+    shape_text = match.group("shape")
+    shape = () if shape_text is None else tuple(
+        int(dimension) for dimension in shape_text.split("x")
+    )
     try:
         dtype = np.dtype(match.group("dtype"))
     except TypeError as error:
@@ -271,7 +411,11 @@ def _parse_tensor_type(text: str) -> TensorType:
     return TensorType(shape, dtype)
 
 
-def _parse_value_references(text: str, context: str) -> list[str]:
+def _parse_value_references(
+    text: str, context: str, *, allow_empty: bool = False
+) -> list[str]:
+    if not text.strip() and allow_empty:
+        return []
     names: list[str] = []
     for reference in text.split(","):
         match = re.fullmatch(rf"%({_IDENTIFIER})", reference.strip())
@@ -279,3 +423,34 @@ def _parse_value_references(text: str, context: str) -> list[str]:
             raise ValueError(f"invalid value reference {reference.strip()!r} in {context}")
         names.append(match.group(1))
     return names
+
+
+def _format_attributes(attributes: Mapping[str, Any]) -> str:
+    if not attributes:
+        return ""
+    serializable = {key: _to_json_value(value) for key, value in attributes.items()}
+    return " " + json.dumps(serializable, sort_keys=True, separators=(",", ":"))
+
+
+def _parse_attributes(text: str | None, line_number: int) -> dict[str, Any]:
+    if text is None:
+        return {}
+    try:
+        attributes = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid attributes on line {line_number}: {error.msg}") from error
+    if not isinstance(attributes, dict):
+        raise ValueError(f"attributes on line {line_number} must be a JSON object")
+    return attributes
+
+
+def _to_json_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {key: _to_json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_to_json_value(item) for item in value]
+    return value

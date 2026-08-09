@@ -16,6 +16,9 @@ class TensorTypeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive integers"):
             TensorType((2, 0))
 
+    def test_supports_scalar_tensor(self) -> None:
+        self.assertEqual(str(TensorType((), "float32")), "tensor<float32>")
+
 
 class GraphBuilderTests(unittest.TestCase):
     def test_builds_and_prints_matmul(self) -> None:
@@ -35,6 +38,30 @@ class GraphBuilderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "dimension mismatch"):
             builder.matmul(lhs, rhs)
+
+    def test_builds_multi_operator_graph_and_use_def(self) -> None:
+        builder = GraphBuilder()
+        lhs = builder.input("lhs", (2, 3))
+        rhs = builder.input("rhs", (3, 4))
+        bias = builder.constant(np.arange(4, dtype=np.float32), name="bias")
+        product = builder.matmul(lhs, rhs, name="product")
+        biased = builder.add(product, bias, name="biased")
+        result = builder.relu(biased, name="result")
+        graph = builder.build(result)
+
+        self.assertEqual(result.type.shape, (2, 4))
+        self.assertEqual(graph.producer(product).op, "matmul")
+        self.assertEqual(graph.users(product), (graph.operations[2],))
+        self.assertIn("digraph TinyAccel", graph.to_dot())
+        self.assertIn("product", graph.to_dot())
+
+    def test_add_rejects_non_broadcastable_shapes(self) -> None:
+        builder = GraphBuilder()
+        lhs = builder.input("lhs", (2, 3))
+        rhs = builder.input("rhs", (4,))
+
+        with self.assertRaisesRegex(ValueError, "not broadcastable"):
+            builder.add(lhs, rhs)
 
 
 class GraphParserTests(unittest.TestCase):
@@ -75,6 +102,18 @@ class GraphParserTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "invalid value reference"):
             parse_graph(text)
+
+    def test_round_trips_constants_add_and_relu(self) -> None:
+        builder = GraphBuilder()
+        value = builder.input("value", (2, 3))
+        zero = builder.constant(0.0, dtype="float32", name="zero")
+        added = builder.add(value, zero, name="added")
+        original = builder.build(builder.relu(added, name="result"))
+
+        restored = parse_graph(str(original))
+
+        self.assertEqual(str(restored), str(original))
+        self.assertEqual(restored.operations[0].attributes["value"].shape, ())
 
 
 if __name__ == "__main__":

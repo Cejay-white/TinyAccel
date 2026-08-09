@@ -5,8 +5,8 @@ hardware works.**
 
 TinyAccel turns a tensor graph into tiled accelerator instructions, executes
 them on a small functional simulator, and explains the cost in cycles and
-memory traffic. The project intentionally starts with one operation—matrix
-multiplication—so the complete stack stays visible and understandable.
+memory traffic. It stays intentionally small so the complete path from a
+multi-operator graph to hardware-style execution remains understandable.
 
 ```text
 Tensor Graph -> Graph IR -> Tiled Lowering -> TinyAccel ISA -> Simulator
@@ -21,6 +21,7 @@ TinyAccel requires Python 3.10+ and NumPy.
 ```bash
 python -m pip install -e .
 python -m examples.matmul
+python -m examples.fusion
 ```
 
 The core API is small:
@@ -73,8 +74,8 @@ Peak SRAM bytes:    2048
 ```
 
 The simulator currently models instructions sequentially. Cycle counts are an
-analytical estimate based on configurable DMA bandwidth and MAC throughput—not
-a cycle-accurate hardware model.
+analytical estimate based on configurable DMA bandwidth and MAC throughput,
+not a cycle-accurate hardware model.
 
 `compiled.timeline()` renders the measured instruction events as a compact
 ASCII Gantt chart. Large programs retain their first and last events while the
@@ -95,14 +96,52 @@ cycles 0                                      1722
 ## What the current prototype contains
 
 - SSA-like graph IR with static shape and dtype validation
+- Constants, scalar/bias broadcasting, `add`, and `relu`
+- Value producer/user queries and multi-output reference execution
 - Canonical IR printing and validated text parsing
-- Rank-2 `matmul` shape inference
+- NumPy reference executor for correctness checking
+- Composable Pass Manager with per-pass IR snapshots
+- Constant folding, algebraic simplification, and dead-code elimination
+- MatMul + bias + ReLU operator fusion
+- GraphViz DOT graph export
 - Configurable M/N/K tiling
-- Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, and `DMA_STORE` instructions
+- Multi-operator tiled lowering with broadcast-aware DMA slices
+- Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, `ADD`, `RELU`, and
+  `DMA_STORE` instructions
 - Functional accelerator simulation checked against NumPy
 - Cycle, DRAM traffic, and peak SRAM reporting
 - Per-instruction cycle events and an ASCII execution timeline
 - Hardware configuration and compile-time SRAM capacity checking
+
+## Optimization pipeline
+
+Compilation runs a deterministic optimization pipeline by default:
+
+```text
+Constant Folding
+      -> Algebraic Simplification
+      -> MatMul + Bias + ReLU Fusion
+      -> Dead Code Elimination
+```
+
+Use `CompileOptions(optimize=False)` to inspect the unoptimized program. The
+fusion example verifies both versions against NumPy and compares instructions,
+cycles, and DRAM traffic:
+
+```bash
+python -m examples.fusion
+```
+
+Passes can also be run independently:
+
+```python
+optimized, trace = tinyaccel.default_pipeline().run_with_trace(graph)
+for result in trace:
+    print(result.pass_name)
+    print(result.graph)
+```
+
+Use `graph.to_dot()` to export either graph for GraphViz rendering.
 
 ## Run tests
 
@@ -112,9 +151,9 @@ python -m unittest discover -v
 
 ## Roadmap
 
-- **v0.2:** more operators, constants, and graph visualization
-- **v0.3:** optimization passes and operator fusion
-- **v0.4:** scheduling and memory planning
+- **v0.2:** multi-operator IR, foundational passes, fusion, and visualization
+- **v0.3:** explicit schedules, buffer lifetime analysis, and memory planning
+- **v0.4:** convolution and layout transformations
 - **v0.5:** richer ISA, timelines, and resource-conflict simulation
 - **v0.6:** PyTorch FX frontend and additional backends
 

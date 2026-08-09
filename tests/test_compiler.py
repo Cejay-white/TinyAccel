@@ -64,6 +64,20 @@ class SimulatorTests(unittest.TestCase):
             executable.last_report.peak_sram_bytes,
             executable.hardware.sram_bytes,
         )
+        self.assertEqual(
+            len(executable.last_report.timeline),
+            len(executable.program.instructions),
+        )
+        self.assertEqual(executable.last_report.timeline[0].start_cycle, 0)
+        self.assertEqual(
+            executable.last_report.timeline[-1].end_cycle,
+            executable.last_report.total_cycles,
+        )
+
+        timeline = executable.timeline(width=30, max_events=6)
+        self.assertIn("Instruction Timeline", timeline)
+        self.assertIn("instructions omitted", timeline)
+        self.assertIn("MATMUL", timeline)
 
     def test_validates_input_shape_and_dtype(self) -> None:
         executable = tinyaccel.compile(build_matmul(2, 3, 4))

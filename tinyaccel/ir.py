@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Iterable
 
 import numpy as np
+
+
+_IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
+_TENSOR_TYPE_SYNTAX = r"tensor<\d+(?:x\d+)*x[A-Za-z][A-Za-z0-9_]*>"
+_TENSOR_TYPE_PATTERN = re.compile(
+    r"tensor<(?P<shape>\d+(?:x\d+)*)x(?P<dtype>[A-Za-z][A-Za-z0-9_]*)>"
+)
 
 
 @dataclass(frozen=True)
@@ -99,6 +107,12 @@ class Graph:
         lines.append("}")
         return "\n".join(lines)
 
+    @classmethod
+    def parse(cls, text: str) -> Graph:
+        """Parse the canonical text produced by :meth:`__str__`."""
+
+        return parse_graph(text)
+
 
 class GraphBuilder:
     """Convenience builder for constructing valid TinyAccel graphs."""
@@ -156,7 +170,7 @@ class GraphBuilder:
                 return name
 
     def _reserve_name(self, name: str) -> None:
-        if not name or not name.isidentifier():
+        if re.fullmatch(_IDENTIFIER, name) is None:
             raise ValueError(f"invalid value name: {name!r}")
         if name in self._names:
             raise ValueError(f"duplicate value name: %{name}")
@@ -167,3 +181,101 @@ class GraphBuilder:
         if value not in known_values:
             raise ValueError(f"value {value} does not belong to this builder")
 
+
+def parse_graph(text: str) -> Graph:
+    """Parse TinyAccel's canonical graph IR.
+
+    The v0.1 grammar intentionally accepts only the operations understood by
+    :class:`GraphBuilder`. This keeps parsing, inference, and validation on one
+    path instead of trusting type annotations embedded in the input text.
+    """
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 3:
+        raise ValueError("IR must contain a graph header, return, and closing brace")
+
+    header = re.fullmatch(r"graph \((.*)\) \{", lines[0])
+    if header is None or lines[-1] != "}":
+        raise ValueError("invalid graph header or missing closing brace")
+
+    builder = GraphBuilder()
+    values: dict[str, Value] = {}
+    arguments = header.group(1).strip()
+    if arguments:
+        for argument in arguments.split(","):
+            match = re.fullmatch(
+                rf"%({_IDENTIFIER})\s*:\s*({_TENSOR_TYPE_SYNTAX})",
+                argument.strip(),
+            )
+            if match is None:
+                raise ValueError(f"invalid graph argument: {argument.strip()!r}")
+            name, type_text = match.groups()
+            tensor_type = _parse_tensor_type(type_text)
+            values[name] = builder.input(name, tensor_type.shape, tensor_type.dtype)
+
+    for line_number, line in enumerate(lines[1:-2], start=2):
+        match = re.fullmatch(
+            rf"%({_IDENTIFIER})\s*=\s*({_IDENTIFIER})\(([^)]*)\)\s*:\s*"
+            rf"({_TENSOR_TYPE_SYNTAX})",
+            line,
+        )
+        if match is None:
+            raise ValueError(f"invalid operation on line {line_number}: {line!r}")
+        output_name, op_name, operand_text, type_text = match.groups()
+        operand_names = _parse_value_references(
+            operand_text, f"operation on line {line_number}"
+        )
+        try:
+            operands = [values[name] for name in operand_names]
+        except KeyError as error:
+            raise ValueError(
+                f"undefined operand %{error.args[0]} on line {line_number}"
+            ) from error
+
+        if op_name == "matmul" and len(operands) == 2:
+            result = builder.matmul(operands[0], operands[1], name=output_name)
+        else:
+            raise ValueError(
+                f"unsupported operation {op_name!r} with {len(operands)} operands "
+                f"on line {line_number}"
+            )
+
+        declared_type = _parse_tensor_type(type_text)
+        if result.type != declared_type:
+            raise ValueError(
+                f"declared type {declared_type} does not match inferred type "
+                f"{result.type} on line {line_number}"
+            )
+        values[output_name] = result
+
+    return_match = re.fullmatch(r"return\s+(.+)", lines[-2])
+    if return_match is None:
+        raise ValueError("graph must end with a return statement")
+    output_names = _parse_value_references(return_match.group(1), "return statement")
+    try:
+        outputs = [values[name] for name in output_names]
+    except KeyError as error:
+        raise ValueError(f"undefined graph output %{error.args[0]}") from error
+    return builder.build(outputs)
+
+
+def _parse_tensor_type(text: str) -> TensorType:
+    match = _TENSOR_TYPE_PATTERN.fullmatch(text)
+    if match is None:
+        raise ValueError(f"invalid tensor type: {text!r}")
+    shape = tuple(int(dimension) for dimension in match.group("shape").split("x"))
+    try:
+        dtype = np.dtype(match.group("dtype"))
+    except TypeError as error:
+        raise ValueError(f"unsupported dtype in tensor type: {text!r}") from error
+    return TensorType(shape, dtype)
+
+
+def _parse_value_references(text: str, context: str) -> list[str]:
+    names: list[str] = []
+    for reference in text.split(","):
+        match = re.fullmatch(rf"%({_IDENTIFIER})", reference.strip())
+        if match is None:
+            raise ValueError(f"invalid value reference {reference.strip()!r} in {context}")
+        names.append(match.group(1))
+    return names

@@ -44,6 +44,16 @@ a_data = np.ones((48, 40), dtype=np.float32)
 b_data = np.ones((40, 24), dtype=np.float32)
 result = compiled.run(a_data, b_data)
 print(compiled.report())
+print(compiled.timeline())
+```
+
+The canonical IR is also parseable, which makes it useful for debugging and
+small compiler experiments:
+
+```python
+text = str(graph)
+restored_graph = tinyaccel.parse_graph(text)
+assert str(restored_graph) == text
 ```
 
 Example report:
@@ -66,14 +76,32 @@ The simulator currently models instructions sequentially. Cycle counts are an
 analytical estimate based on configurable DMA bandwidth and MAC throughput—not
 a cycle-accurate hardware model.
 
-## What v0.1 contains
+`compiled.timeline()` renders the measured instruction events as a compact
+ASCII Gantt chart. Large programs retain their first and last events while the
+middle is folded:
+
+```text
+TinyAccel Instruction Timeline
+cycles 0                                      1722
+0000 ZERO      [     0,4     ) |#                                               |
+0001 DMA_LOAD  [     4,20    ) |#                                               |
+0002 DMA_LOAD  [    20,36    ) |##                                              |
+     ... 96 instructions omitted ...
+0099 DMA_LOAD  [  1682,1690  ) |                                              ##|
+0100 MATMUL    [  1690,1706  ) |                                               #|
+0101 DMA_STORE [  1706,1722  ) |                                               #|
+```
+
+## What the current prototype contains
 
 - SSA-like graph IR with static shape and dtype validation
+- Canonical IR printing and validated text parsing
 - Rank-2 `matmul` shape inference
 - Configurable M/N/K tiling
 - Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, and `DMA_STORE` instructions
 - Functional accelerator simulation checked against NumPy
 - Cycle, DRAM traffic, and peak SRAM reporting
+- Per-instruction cycle events and an ASCII execution timeline
 - Hardware configuration and compile-time SRAM capacity checking
 
 ## Run tests
@@ -84,7 +112,7 @@ python -m unittest discover -v
 
 ## Roadmap
 
-- **v0.2:** more operators, constants, IR parsing and visualization
+- **v0.2:** more operators, constants, and graph visualization
 - **v0.3:** optimization passes and operator fusion
 - **v0.4:** scheduling and memory planning
 - **v0.5:** richer ISA, timelines, and resource-conflict simulation

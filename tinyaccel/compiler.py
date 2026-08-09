@@ -63,6 +63,11 @@ class Executable:
             raise RuntimeError("run the executable before requesting a report")
         return str(self.last_report)
 
+    def timeline(self, *, width: int = 48, max_events: int = 24) -> str:
+        if self.last_report is None:
+            raise RuntimeError("run the executable before requesting a timeline")
+        return self.last_report.format_timeline(width=width, max_events=max_events)
+
 
 def compile(
     graph: Graph,

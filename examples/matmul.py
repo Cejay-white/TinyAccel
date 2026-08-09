@@ -31,4 +31,5 @@ print("-------------")
 print(executable.program)
 print()
 print(executable.report())
-
+print()
+print(executable.timeline(max_events=12))

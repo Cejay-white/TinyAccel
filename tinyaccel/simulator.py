@@ -14,6 +14,18 @@ from .isa import Instruction, Opcode, Program
 
 
 @dataclass(frozen=True)
+class TimelineEvent:
+    instruction_index: int
+    opcode: str
+    start_cycle: int
+    end_cycle: int
+
+    @property
+    def cycles(self) -> int:
+        return self.end_cycle - self.start_cycle
+
+
+@dataclass(frozen=True)
 class SimulationReport:
     total_cycles: int
     instruction_counts: Mapping[str, int]
@@ -21,6 +33,7 @@ class SimulationReport:
     dram_bytes_read: int
     dram_bytes_written: int
     peak_sram_bytes: int
+    timeline: tuple[TimelineEvent, ...]
 
     def __str__(self) -> str:
         lines = ["TinyAccel Simulation Report", "=" * 28]
@@ -41,6 +54,43 @@ class SimulationReport:
         )
         return "\n".join(lines)
 
+    def format_timeline(self, *, width: int = 48, max_events: int = 24) -> str:
+        """Render a compact Gantt-style view of sequential instruction costs."""
+
+        if width < 10:
+            raise ValueError("timeline width must be at least 10")
+        if max_events < 2:
+            raise ValueError("max_events must be at least 2")
+
+        events: list[TimelineEvent | None] = list(self.timeline)
+        omitted = len(events) - max_events
+        if omitted > 0:
+            head_count = max_events // 2
+            tail_count = max_events - head_count
+            events = events[:head_count] + [None] + events[-tail_count:]
+
+        lines = [
+            "TinyAccel Instruction Timeline",
+            f"cycles 0{' ' * max(1, width - len(str(self.total_cycles)) - 1)}"
+            f"{self.total_cycles}",
+        ]
+        total = max(1, self.total_cycles)
+        for event in events:
+            if event is None:
+                lines.append(f"     ... {omitted} instructions omitted ...")
+                continue
+            start = min(width - 1, event.start_cycle * width // total)
+            end = min(
+                width,
+                max(start + 1, (event.end_cycle * width + total - 1) // total),
+            )
+            bar = " " * start + "#" * (end - start) + " " * (width - end)
+            lines.append(
+                f"{event.instruction_index:04d} {event.opcode:<9} "
+                f"[{event.start_cycle:>6},{event.end_cycle:<6}) |{bar}|"
+            )
+        return "\n".join(lines)
+
 
 class Simulator:
     """Execute ISA instructions and account for sequential resource costs."""
@@ -59,13 +109,24 @@ class Simulator:
         bytes_read = 0
         bytes_written = 0
         peak_sram_bytes = 0
+        current_cycle = 0
+        timeline: list[TimelineEvent] = []
 
-        for instruction in program.instructions:
+        for index, instruction in enumerate(program.instructions):
             instruction_counts[instruction.opcode.value] += 1
             cycles, read, written = self._execute(
                 instruction, validated_feeds, output, buffers
             )
             cycles_by_opcode[instruction.opcode.value] += cycles
+            timeline.append(
+                TimelineEvent(
+                    index,
+                    instruction.opcode.value,
+                    current_cycle,
+                    current_cycle + cycles,
+                )
+            )
+            current_cycle += cycles
             bytes_read += read
             bytes_written += written
             current_sram = sum(buffer.nbytes for buffer in buffers.values())
@@ -83,6 +144,7 @@ class Simulator:
             bytes_read,
             bytes_written,
             peak_sram_bytes,
+            tuple(timeline),
         )
         return output, report
 
@@ -152,4 +214,3 @@ class Simulator:
                 )
             validated[name] = value
         return validated
-

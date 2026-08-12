@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from .memory import MemoryPlan
 
 
 class Opcode(str, Enum):
@@ -39,6 +42,7 @@ class Program:
         default_factory=dict
     )
     constants: Mapping[str, np.ndarray] = field(default_factory=dict)
+    memory_plan: MemoryPlan | None = None
 
     def __str__(self) -> str:
         return "\n".join(

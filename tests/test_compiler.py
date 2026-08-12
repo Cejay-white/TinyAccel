@@ -39,7 +39,8 @@ class CompilerTests(unittest.TestCase):
         executable = tinyaccel.compile(
             build_matmul(2, 2, 2),
             options=tinyaccel.CompileOptions(tile_m=64, tile_n=64, tile_k=64),
-            hardware=tinyaccel.HardwareConfig(sram_bytes=48),
+            # 64 aligned bytes for the planned output plus 48 bytes of tile SRAM.
+            hardware=tinyaccel.HardwareConfig(sram_bytes=112),
         )
 
         self.assertEqual(len(executable.program.instructions), 5)

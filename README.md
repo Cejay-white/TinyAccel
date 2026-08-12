@@ -9,9 +9,9 @@ memory traffic. It stays intentionally small so the complete path from a
 multi-operator graph to hardware-style execution remains understandable.
 
 ```text
-Tensor Graph -> Graph IR -> Tiled Lowering -> TinyAccel ISA -> Simulator
-                                                              |
-                                      Result + cycle/memory report
+Tensor Graph -> Graph IR -> Schedule -> Memory Plan -> TinyAccel ISA -> Simulator
+                                                                       |
+                                               Result + cycle/memory report
 ```
 
 ## Quick start
@@ -22,6 +22,7 @@ TinyAccel requires Python 3.10+ and NumPy.
 python -m pip install -e .
 python -m examples.matmul
 python -m examples.fusion
+python -m examples.schedule_memory
 ```
 
 The core API is small:
@@ -46,6 +47,8 @@ b_data = np.ones((40, 24), dtype=np.float32)
 result = compiled.run(a_data, b_data)
 print(compiled.report())
 print(compiled.timeline())
+print(compiled.schedule)
+print(compiled.memory_plan)
 ```
 
 The canonical IR is also parseable, which makes it useful for debugging and
@@ -70,7 +73,7 @@ DMA_STORE  instructions=6    cycles=144
 Total cycles:       1722
 DRAM bytes read:    26880
 DRAM bytes written: 4608
-Peak SRAM bytes:    2048
+Peak SRAM bytes:    6656
 ```
 
 The simulator currently models instructions sequentially. Cycle counts are an
@@ -105,6 +108,10 @@ cycles 0                                      1722
 - MatMul + bias + ReLU operator fusion
 - GraphViz DOT graph export
 - Configurable M/N/K tiling
+- Explicit spatial/reduction loop schedules used by ISA lowering
+- SSA value lifetime analysis
+- Alignment-aware linear-scan SRAM planning with buffer reuse
+- Arena-backed simulation of planned intermediate tensors
 - Multi-operator tiled lowering with broadcast-aware DMA slices
 - Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, `ADD`, `RELU`, and
   `DMA_STORE` instructions
@@ -143,6 +150,22 @@ for result in trace:
 
 Use `graph.to_dot()` to export either graph for GraphViz rendering.
 
+## Scheduling and memory planning
+
+Compilation retains the explicit forms between graph optimization and ISA
+lowering. They can be inspected directly:
+
+```python
+print(compiled.schedule)
+print(compiled.memory_plan)
+```
+
+Schedules describe spatial and reduction loops, their extents, tile sizes, and
+tile counts. The memory planner computes each SSA result's live interval and
+uses first-fit allocation to reuse aligned SRAM arena ranges whose lifetimes do
+not overlap. Inputs and constants remain external/immutable; generated tensor
+results are views into the planned arena used by the simulator.
+
 ## Run tests
 
 ```bash
@@ -152,7 +175,8 @@ python -m unittest discover -v
 ## Roadmap
 
 - **v0.2:** multi-operator IR, foundational passes, fusion, and visualization
-- **v0.3:** explicit schedules, buffer lifetime analysis, and memory planning
+- **v0.3 (current):** explicit schedules, lifetime analysis, and memory
+  planning
 - **v0.4:** convolution and layout transformations
 - **v0.5:** richer ISA, timelines, and resource-conflict simulation
 - **v0.6:** PyTorch FX frontend and additional backends

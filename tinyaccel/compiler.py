@@ -9,9 +9,11 @@ from typing import TYPE_CHECKING, Iterable
 import numpy as np
 
 from .hardware import HardwareConfig
-from .ir import Graph, Operation, TensorType
+from .ir import Graph, TensorType
 from .isa import Instruction, Opcode, Program
+from .memory import MemoryPlan, plan_memory
 from .passes import default_pipeline
+from .schedule import Schedule, ScheduledOperation, create_schedule
 
 if TYPE_CHECKING:
     from .simulator import SimulationReport
@@ -44,10 +46,14 @@ class Executable:
         program: Program,
         hardware: HardwareConfig,
         graph: Graph,
+        schedule: Schedule,
+        memory_plan: MemoryPlan,
     ) -> None:
         self.program = program
         self.hardware = hardware
         self.graph = graph
+        self.schedule = schedule
+        self.memory_plan = memory_plan
         self.last_report: SimulationReport | None = None
 
     def run(self, *inputs: np.ndarray, **named_inputs: np.ndarray) -> np.ndarray:
@@ -97,21 +103,33 @@ def compile(
         if value.type.dtype != np.dtype("float32"):
             raise NotImplementedError("accelerator backend currently supports float32")
 
+    schedule = create_schedule(
+        lowered_graph,
+        tile_m=options.tile_m,
+        tile_n=options.tile_n,
+        tile_k=options.tile_k,
+    )
+    memory_plan = plan_memory(
+        lowered_graph, capacity_bytes=hardware.sram_bytes
+    )
     instructions: list[Instruction] = []
     constants: dict[str, np.ndarray] = {}
-    for operation in lowered_graph.operations:
+    for scheduled in schedule.operations:
+        operation = scheduled.operation
         if operation.op == "constant":
             constants[operation.output.name] = np.asarray(
                 operation.attributes["value"], dtype=operation.output.type.dtype
             ).copy()
         elif operation.op == "matmul":
-            _lower_matmul(operation, instructions, options, hardware)
+            _lower_matmul(scheduled, instructions, hardware, memory_plan.total_bytes)
         elif operation.op == "add":
-            _lower_add(operation, instructions, options, hardware)
+            _lower_add(scheduled, instructions, hardware, memory_plan.total_bytes)
         elif operation.op == "relu":
-            _lower_relu(operation, instructions, options, hardware)
+            _lower_relu(scheduled, instructions, hardware, memory_plan.total_bytes)
         elif operation.op == "matmul_bias_relu":
-            _lower_matmul_bias_relu(operation, instructions, options, hardware)
+            _lower_matmul_bias_relu(
+                scheduled, instructions, hardware, memory_plan.total_bytes
+            )
         else:
             raise NotImplementedError(
                 f"accelerator backend does not support {operation.op!r}"
@@ -134,26 +152,31 @@ def compile(
         output.type.dtype,
         value_types,
         constants,
+        memory_plan,
     )
-    return Executable(program, hardware, lowered_graph)
+    return Executable(program, hardware, lowered_graph, schedule, memory_plan)
 
 
 def _lower_matmul(
-    operation: Operation,
+    scheduled: ScheduledOperation,
     instructions: list[Instruction],
-    options: CompileOptions,
     hardware: HardwareConfig,
+    reserved_sram_bytes: int,
 ) -> None:
+    operation = scheduled.operation
     lhs, rhs = operation.inputs
     output = operation.output
     m_size, k_size = lhs.type.shape
     _, n_size = rhs.type.shape
 
-    for m_offset in range(0, m_size, options.tile_m):
-        m_extent = min(options.tile_m, m_size - m_offset)
-        for n_offset in range(0, n_size, options.tile_n):
-            n_extent = min(options.tile_n, n_size - n_offset)
-            max_k_extent = min(options.tile_k, k_size)
+    tile_m = scheduled.loop("m").tile
+    tile_n = scheduled.loop("n").tile
+    tile_k = scheduled.loop("k").tile
+    for m_offset in range(0, m_size, tile_m):
+        m_extent = min(tile_m, m_size - m_offset)
+        for n_offset in range(0, n_size, tile_n):
+            n_extent = min(tile_n, n_size - n_offset)
+            max_k_extent = min(tile_k, k_size)
             _require_sram(
                 (
                     m_extent * max_k_extent
@@ -163,6 +186,7 @@ def _lower_matmul(
                 * output.type.dtype.itemsize,
                 hardware,
                 "matmul tile",
+                reserved_sram_bytes,
             )
             instructions.append(
                 Instruction(
@@ -170,8 +194,8 @@ def _lower_matmul(
                     {"buffer": "acc", "shape": (m_extent, n_extent)},
                 )
             )
-            for k_offset in range(0, k_size, options.tile_k):
-                k_extent = min(options.tile_k, k_size - k_offset)
+            for k_offset in range(0, k_size, tile_k):
+                k_extent = min(tile_k, k_size - k_offset)
                 instructions.extend(
                     (
                         _load(
@@ -203,22 +227,27 @@ def _lower_matmul(
 
 
 def _lower_add(
-    operation: Operation,
+    scheduled: ScheduledOperation,
     instructions: list[Instruction],
-    options: CompileOptions,
     hardware: HardwareConfig,
+    reserved_sram_bytes: int,
 ) -> None:
+    operation = scheduled.operation
     lhs, rhs = operation.inputs
     output = operation.output
-    for offset, shape in _output_tiles(output.type, options):
-        lhs_offset, lhs_shape = _broadcast_slice(lhs.type.shape, output.type.shape, offset, shape)
-        rhs_offset, rhs_shape = _broadcast_slice(rhs.type.shape, output.type.shape, offset, shape)
+    for offset, shape in _output_tiles(output.type, scheduled):
+        lhs_offset, lhs_shape = _broadcast_slice(
+            lhs.type.shape, output.type.shape, offset, shape
+        )
+        rhs_offset, rhs_shape = _broadcast_slice(
+            rhs.type.shape, output.type.shape, offset, shape
+        )
         required = (
             _element_count(lhs_shape)
             + _element_count(rhs_shape)
             + _element_count(shape)
         ) * output.type.dtype.itemsize
-        _require_sram(required, hardware, "add tile")
+        _require_sram(required, hardware, "add tile", reserved_sram_bytes)
         instructions.extend(
             (
                 _load(lhs.name, "lhs", lhs_offset, lhs_shape),
@@ -233,16 +262,17 @@ def _lower_add(
 
 
 def _lower_relu(
-    operation: Operation,
+    scheduled: ScheduledOperation,
     instructions: list[Instruction],
-    options: CompileOptions,
     hardware: HardwareConfig,
+    reserved_sram_bytes: int,
 ) -> None:
+    operation = scheduled.operation
     source = operation.inputs[0]
     output = operation.output
-    for offset, shape in _output_tiles(output.type, options):
+    for offset, shape in _output_tiles(output.type, scheduled):
         required = 2 * _element_count(shape) * output.type.dtype.itemsize
-        _require_sram(required, hardware, "relu tile")
+        _require_sram(required, hardware, "relu tile", reserved_sram_bytes)
         instructions.extend(
             (
                 _load(source.name, "lhs", offset, shape),
@@ -253,21 +283,25 @@ def _lower_relu(
 
 
 def _lower_matmul_bias_relu(
-    operation: Operation,
+    scheduled: ScheduledOperation,
     instructions: list[Instruction],
-    options: CompileOptions,
     hardware: HardwareConfig,
+    reserved_sram_bytes: int,
 ) -> None:
+    operation = scheduled.operation
     lhs, rhs, bias = operation.inputs
     output = operation.output
     m_size, k_size = lhs.type.shape
     _, n_size = rhs.type.shape
 
-    for m_offset in range(0, m_size, options.tile_m):
-        m_extent = min(options.tile_m, m_size - m_offset)
-        for n_offset in range(0, n_size, options.tile_n):
-            n_extent = min(options.tile_n, n_size - n_offset)
-            max_k_extent = min(options.tile_k, k_size)
+    tile_m = scheduled.loop("m").tile
+    tile_n = scheduled.loop("n").tile
+    tile_k = scheduled.loop("k").tile
+    for m_offset in range(0, m_size, tile_m):
+        m_extent = min(tile_m, m_size - m_offset)
+        for n_offset in range(0, n_size, tile_n):
+            n_extent = min(tile_n, n_size - n_offset)
+            max_k_extent = min(tile_k, k_size)
             bias_offset, bias_shape = _broadcast_slice(
                 bias.type.shape,
                 output.type.shape,
@@ -288,15 +322,17 @@ def _lower_matmul_bias_relu(
                 )
                 * output.type.dtype.itemsize,
             )
-            _require_sram(required, hardware, "fused matmul tile")
+            _require_sram(
+                required, hardware, "fused matmul tile", reserved_sram_bytes
+            )
             instructions.append(
                 Instruction(
                     Opcode.ZERO,
                     {"buffer": "acc", "shape": (m_extent, n_extent)},
                 )
             )
-            for k_offset in range(0, k_size, options.tile_k):
-                k_extent = min(options.tile_k, k_size - k_offset)
+            for k_offset in range(0, k_size, tile_k):
+                k_extent = min(tile_k, k_size - k_offset)
                 instructions.extend(
                     (
                         _load(
@@ -336,16 +372,13 @@ def _lower_matmul_bias_relu(
 
 
 def _output_tiles(
-    tensor_type: TensorType, options: CompileOptions
+    tensor_type: TensorType, scheduled: ScheduledOperation
 ) -> Iterable[tuple[tuple[int, ...], tuple[int, ...]]]:
     shape = tensor_type.shape
     if not shape:
         yield (), ()
         return
-    tile_shape = list(shape)
-    tile_shape[-1] = min(shape[-1], options.tile_n)
-    if len(shape) >= 2:
-        tile_shape[-2] = min(shape[-2], options.tile_m)
+    tile_shape = [loop.tile for loop in scheduled.loops]
     ranges = [range(0, extent, tile) for extent, tile in zip(shape, tile_shape)]
     for offset in product(*ranges):
         extent = tuple(
@@ -403,10 +436,15 @@ def _element_count(shape: tuple[int, ...]) -> int:
 
 
 def _require_sram(
-    required_bytes: int, hardware: HardwareConfig, description: str
+    required_bytes: int,
+    hardware: HardwareConfig,
+    description: str,
+    reserved_bytes: int = 0,
 ) -> None:
-    if required_bytes > hardware.sram_bytes:
+    total_bytes = reserved_bytes + required_bytes
+    if total_bytes > hardware.sram_bytes:
         raise ValueError(
-            f"{description} requires {required_bytes} SRAM bytes, but hardware has "
-            f"{hardware.sram_bytes}"
+            f"{description} requires {required_bytes} SRAM bytes plus "
+            f"{reserved_bytes} planned bytes ({total_bytes} total), but hardware "
+            f"has {hardware.sram_bytes}"
         )

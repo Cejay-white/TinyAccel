@@ -115,6 +115,17 @@ class Simulator:
                 program.output_shape,
                 program.output_dtype,
             )
+        arena = None
+        if program.memory_plan is not None:
+            arena = np.empty(program.memory_plan.total_bytes, dtype=np.uint8)
+            for name, allocation in program.memory_plan.allocations.items():
+                shape, dtype = value_types[name]
+                memory[name] = np.ndarray(
+                    shape,
+                    dtype=dtype,
+                    buffer=arena,
+                    offset=allocation.offset,
+                )
         for name, (shape, dtype) in value_types.items():
             if name not in memory:
                 memory[name] = np.empty(shape, dtype=dtype)
@@ -123,7 +134,13 @@ class Simulator:
         cycles_by_opcode: Counter[str] = Counter()
         bytes_read = 0
         bytes_written = 0
-        peak_sram_bytes = 0
+        planned_sram_bytes = 0 if arena is None else arena.nbytes
+        peak_sram_bytes = planned_sram_bytes
+        if peak_sram_bytes > self.hardware.sram_bytes:
+            raise RuntimeError(
+                f"memory plan uses {peak_sram_bytes} SRAM bytes, exceeding "
+                f"the {self.hardware.sram_bytes}-byte capacity"
+            )
         current_cycle = 0
         timeline: list[TimelineEvent] = []
 
@@ -144,7 +161,9 @@ class Simulator:
             current_cycle += cycles
             bytes_read += read
             bytes_written += written
-            current_sram = sum(buffer.nbytes for buffer in buffers.values())
+            current_sram = planned_sram_bytes + sum(
+                buffer.nbytes for buffer in buffers.values()
+            )
             peak_sram_bytes = max(peak_sram_bytes, current_sram)
             if current_sram > self.hardware.sram_bytes:
                 raise RuntimeError(

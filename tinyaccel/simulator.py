@@ -198,10 +198,16 @@ class Simulator:
 
         if instruction.opcode is Opcode.DMA_LOAD:
             source = memory[operands["source"]]
-            tile = _read_tile(source, operands["offset"], operands["shape"])
+            if operands.get("padded", False):
+                tile, transferred_bytes = _read_padded_tile(
+                    source, operands["offset"], operands["shape"]
+                )
+            else:
+                tile = _read_tile(source, operands["offset"], operands["shape"])
+                transferred_bytes = tile.nbytes
             buffers[operands["buffer"]] = tile
-            cycles = ceil(tile.nbytes / self.hardware.dma_bytes_per_cycle)
-            return cycles, tile.nbytes, 0
+            cycles = ceil(transferred_bytes / self.hardware.dma_bytes_per_cycle)
+            return cycles, transferred_bytes, 0
 
         if instruction.opcode is Opcode.MATMUL:
             lhs = buffers[operands["lhs"]]
@@ -223,6 +229,32 @@ class Simulator:
             buffers[operands["output"]] = result
             cycles = ceil(result.size / self.hardware.macs_per_cycle)
             return cycles, 0, 0
+
+        if instruction.opcode is Opcode.CONV2D:
+            input_tile = buffers[operands["input"]]
+            weight = buffers[operands["weight"]]
+            accumulator = buffers[operands["accumulator"]]
+            stride_h, stride_w = operands["stride"]
+            dilation_h, dilation_w = operands["dilation"]
+            kernel_h, kernel_w, input_c, _ = weight.shape
+            _, output_h, output_w, output_c = accumulator.shape
+            effective_h = (kernel_h - 1) * dilation_h + 1
+            effective_w = (kernel_w - 1) * dilation_w + 1
+            for output_y in range(output_h):
+                input_y = output_y * stride_h
+                for output_x in range(output_w):
+                    input_x = output_x * stride_w
+                    patch = input_tile[
+                        0,
+                        input_y : input_y + effective_h : dilation_h,
+                        input_x : input_x + effective_w : dilation_w,
+                        :,
+                    ]
+                    accumulator[0, output_y, output_x, :] += np.tensordot(
+                        patch, weight, axes=((0, 1, 2), (0, 1, 2))
+                    )
+            macs = output_h * output_w * output_c * kernel_h * kernel_w * input_c
+            return ceil(macs / self.hardware.macs_per_cycle), 0, 0
 
         if instruction.opcode is Opcode.DMA_STORE:
             tile = buffers[operands["buffer"]]
@@ -275,6 +307,29 @@ def _read_tile(
         slice(start, start + extent) for start, extent in zip(offset, shape)
     )
     return source[slices].copy()
+
+
+def _read_padded_tile(
+    source: np.ndarray,
+    offset: tuple[int, ...],
+    shape: tuple[int, ...],
+) -> tuple[np.ndarray, int]:
+    """Read a possibly out-of-bounds tile, filling the halo with zeros."""
+
+    tile = np.zeros(shape, dtype=source.dtype)
+    source_slices: list[slice] = []
+    tile_slices: list[slice] = []
+    for dimension, start, extent in zip(source.shape, offset, shape):
+        source_start = max(0, start)
+        source_stop = min(dimension, start + extent)
+        if source_stop <= source_start:
+            return tile, 0
+        tile_start = source_start - start
+        source_slices.append(slice(source_start, source_stop))
+        tile_slices.append(slice(tile_start, tile_start + source_stop - source_start))
+    tile[tuple(tile_slices)] = source[tuple(source_slices)]
+    transferred_bytes = int(source[tuple(source_slices)].nbytes)
+    return tile, transferred_bytes
 
 
 def _write_tile(

@@ -18,6 +18,7 @@ class Opcode(str, Enum):
     MATMUL = "MATMUL"
     ADD = "ADD"
     RELU = "RELU"
+    CONV2D = "CONV2D"
     DMA_STORE = "DMA_STORE"
 
 

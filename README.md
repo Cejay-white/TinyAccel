@@ -3,10 +3,11 @@
 **A minimal AI compiler and accelerator simulator for learning how modern AI
 hardware works.**
 
-TinyAccel turns a tensor graph into tiled accelerator instructions, executes
-them on a small functional simulator, and explains the cost in cycles and
-memory traffic. It stays intentionally small so the complete path from a
-multi-operator graph to hardware-style execution remains understandable.
+TinyAccel turns tensor and NHWC convolution graphs into tiled accelerator
+instructions, executes them on a small functional simulator, and explains the
+cost in cycles and memory traffic. It stays intentionally small so the complete
+path from a multi-operator graph to hardware-style execution remains
+understandable.
 
 ```text
 Tensor Graph -> Graph IR -> Schedule -> Memory Plan -> TinyAccel ISA -> Simulator
@@ -23,6 +24,7 @@ python -m pip install -e .
 python -m examples.matmul
 python -m examples.fusion
 python -m examples.schedule_memory
+python -m examples.conv2d
 ```
 
 The core API is small:
@@ -99,6 +101,8 @@ cycles 0                                      1722
 ## What the current prototype contains
 
 - SSA-like graph IR with static shape and dtype validation
+- Tensor layouts as canonical type metadata (`NHWC`, `NCHW`, `HWIO`, `OIHW`)
+- Float32 NHWC-by-HWIO Conv2D with stride, padding, and dilation
 - Constants, scalar/bias broadcasting, `add`, and `relu`
 - Value producer/user queries and multi-output reference execution
 - Canonical IR printing and validated text parsing
@@ -109,11 +113,12 @@ cycles 0                                      1722
 - GraphViz DOT graph export
 - Configurable M/N/K tiling
 - Explicit spatial/reduction loop schedules used by ISA lowering
+- Conv2D schedules over `N/H/W/OC` and reductions over `KH/KW/IC`
 - SSA value lifetime analysis
 - Alignment-aware linear-scan SRAM planning with buffer reuse
 - Arena-backed simulation of planned intermediate tensors
 - Multi-operator tiled lowering with broadcast-aware DMA slices
-- Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, `ADD`, `RELU`, and
+- Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, `ADD`, `RELU`, `CONV2D`, and
   `DMA_STORE` instructions
 - Functional accelerator simulation checked against NumPy
 - Cycle, DRAM traffic, and peak SRAM reporting
@@ -175,9 +180,10 @@ python -m unittest discover -v
 ## Roadmap
 
 - **v0.2:** multi-operator IR, foundational passes, fusion, and visualization
-- **v0.3 (current):** explicit schedules, lifetime analysis, and memory
+- **v0.3:** explicit schedules, lifetime analysis, and memory
   planning
-- **v0.4:** convolution and layout transformations
+- **v0.4 (current):** NHWC Conv2D from Graph IR through tiled ISA and simulation
+- **v0.4 next:** NCHW, layout transformations, and im2col comparison
 - **v0.5:** richer ISA, timelines, and resource-conflict simulation
 - **v0.6:** PyTorch FX frontend and additional backends
 

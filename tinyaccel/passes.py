@@ -62,7 +62,11 @@ class ConstantFoldingPass:
                 operations.append(operation)
                 continue
 
-            if operation.inputs and all(value in constants for value in operation.inputs):
+            if (
+                operation.op in {"matmul", "add", "relu", "matmul_bias_relu"}
+                and operation.inputs
+                and all(value in constants for value in operation.inputs)
+            ):
                 inputs = [constants[value] for value in operation.inputs]
                 folded = _evaluate_operation(operation.op, inputs)
                 folded = np.asarray(folded, dtype=operation.output.type.dtype)

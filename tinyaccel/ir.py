@@ -11,11 +11,8 @@ import numpy as np
 
 
 _IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
-_TENSOR_TYPE_SYNTAX = r"tensor<(?:\d+x)*[A-Za-z][A-Za-z0-9_]*>"
-_TENSOR_TYPE_PATTERN = re.compile(
-    r"tensor<(?:(?P<shape>\d+(?:x\d+)*)x)?"
-    r"(?P<dtype>[A-Za-z][A-Za-z0-9_]*)>"
-)
+_TENSOR_TYPE_SYNTAX = r"tensor<[^>]+>"
+_LAYOUTS = frozenset({"NCHW", "NHWC", "OIHW", "HWIO"})
 
 
 @dataclass(frozen=True)
@@ -24,6 +21,7 @@ class TensorType:
 
     shape: tuple[int, ...]
     dtype: np.dtype = field(default_factory=lambda: np.dtype("float32"))
+    layout: str | None = None
 
     def __post_init__(self) -> None:
         shape = tuple(self.shape)
@@ -31,12 +29,20 @@ class TensorType:
             raise ValueError(f"tensor dimensions must be positive integers, got {shape}")
         object.__setattr__(self, "shape", shape)
         object.__setattr__(self, "dtype", np.dtype(self.dtype))
+        if self.layout is not None:
+            layout = str(self.layout).upper()
+            if layout not in _LAYOUTS:
+                raise ValueError(f"unsupported tensor layout: {self.layout!r}")
+            if len(shape) != 4:
+                raise ValueError(f"layout {layout} requires a rank-4 tensor")
+            object.__setattr__(self, "layout", layout)
 
     def __str__(self) -> str:
         prefix = "x".join(str(dim) for dim in self.shape)
         if prefix:
             prefix += "x"
-        return f"tensor<{prefix}{self.dtype.name}>"
+        layout = "" if self.layout is None else f", layout={self.layout}"
+        return f"tensor<{prefix}{self.dtype.name}{layout}>"
 
 
 @dataclass(frozen=True)
@@ -173,9 +179,10 @@ class GraphBuilder:
         name: str,
         shape: Iterable[int],
         dtype: str | np.dtype = "float32",
+        layout: str | None = None,
     ) -> Value:
         self._reserve_name(name)
-        value = Value(name, TensorType(tuple(shape), np.dtype(dtype)))
+        value = Value(name, TensorType(tuple(shape), np.dtype(dtype), layout))
         self._inputs.append(value)
         return value
 
@@ -185,11 +192,12 @@ class GraphBuilder:
         *,
         dtype: str | np.dtype | None = None,
         name: str | None = None,
+        layout: str | None = None,
     ) -> Value:
         array = np.asarray(value, dtype=dtype)
         if array.dtype.kind not in "biuf":
             raise ValueError(f"unsupported constant dtype: {array.dtype}")
-        output = self._new_output(name, TensorType(array.shape, array.dtype))
+        output = self._new_output(name, TensorType(array.shape, array.dtype, layout))
         self._operations.append(
             Operation("constant", (), output, {"value": array.copy()})
         )
@@ -215,6 +223,14 @@ class GraphBuilder:
     def add(self, lhs: Value, rhs: Value, name: str | None = None) -> Value:
         self._require_defined(lhs, rhs)
         self._require_same_dtype("add", lhs, rhs)
+        if (
+            lhs.type.layout is not None
+            and rhs.type.layout is not None
+            and lhs.type.layout != rhs.type.layout
+        ):
+            raise ValueError(
+                f"add layout mismatch: {lhs.type.layout!r} and {rhs.type.layout!r}"
+            )
         try:
             shape = np.broadcast_shapes(lhs.type.shape, rhs.type.shape)
         except ValueError as error:
@@ -222,7 +238,8 @@ class GraphBuilder:
                 f"add shapes are not broadcastable: {lhs.type.shape} and "
                 f"{rhs.type.shape}"
             ) from error
-        output = self._new_output(name, TensorType(shape, lhs.type.dtype))
+        layout = lhs.type.layout or rhs.type.layout
+        output = self._new_output(name, TensorType(shape, lhs.type.dtype, layout))
         self._operations.append(Operation("add", (lhs, rhs), output))
         return output
 
@@ -230,6 +247,59 @@ class GraphBuilder:
         self._require_defined(value)
         output = self._new_output(name, value.type)
         self._operations.append(Operation("relu", (value,), output))
+        return output
+
+    def conv2d(
+        self,
+        input_value: Value,
+        weight: Value,
+        *,
+        stride: int | Iterable[int] = (1, 1),
+        padding: int | Iterable[int] = (0, 0, 0, 0),
+        dilation: int | Iterable[int] = (1, 1),
+        name: str | None = None,
+    ) -> Value:
+        """Build a float32 NHWC x HWIO two-dimensional convolution."""
+
+        self._require_defined(input_value, weight)
+        self._require_same_dtype("conv2d", input_value, weight)
+        if input_value.type.dtype != np.dtype("float32"):
+            raise ValueError("conv2d currently requires float32 tensors")
+        if input_value.type.layout != "NHWC" or weight.type.layout != "HWIO":
+            raise ValueError("conv2d currently requires NHWC input and HWIO weight")
+        stride_pair = _normalize_pair("stride", stride)
+        dilation_pair = _normalize_pair("dilation", dilation)
+        padding_quad = _normalize_padding(padding)
+        n_size, input_h, input_w, input_c = input_value.type.shape
+        kernel_h, kernel_w, weight_c, output_c = weight.type.shape
+        if input_c != weight_c:
+            raise ValueError(
+                f"conv2d input channels mismatch: {input_c} and {weight_c}"
+            )
+        effective_h = (kernel_h - 1) * dilation_pair[0] + 1
+        effective_w = (kernel_w - 1) * dilation_pair[1] + 1
+        padded_h = input_h + padding_quad[0] + padding_quad[1]
+        padded_w = input_w + padding_quad[2] + padding_quad[3]
+        if padded_h < effective_h or padded_w < effective_w:
+            raise ValueError("conv2d effective kernel exceeds padded input")
+        output_h = (padded_h - effective_h) // stride_pair[0] + 1
+        output_w = (padded_w - effective_w) // stride_pair[1] + 1
+        output = self._new_output(
+            name,
+            TensorType((n_size, output_h, output_w, output_c), "float32", "NHWC"),
+        )
+        self._operations.append(
+            Operation(
+                "conv2d",
+                (input_value, weight),
+                output,
+                {
+                    "stride": stride_pair,
+                    "padding": padding_quad,
+                    "dilation": dilation_pair,
+                },
+            )
+        )
         return output
 
     def matmul_bias_relu(
@@ -320,7 +390,7 @@ def parse_graph(text: str) -> Graph:
     values: dict[str, Value] = {}
     arguments = header.group(1).strip()
     if arguments:
-        for argument in arguments.split(","):
+        for argument in _split_graph_arguments(arguments):
             match = re.fullmatch(
                 rf"%({_IDENTIFIER})\s*:\s*({_TENSOR_TYPE_SYNTAX})",
                 argument.strip(),
@@ -329,7 +399,9 @@ def parse_graph(text: str) -> Graph:
                 raise ValueError(f"invalid graph argument: {argument.strip()!r}")
             name, type_text = match.groups()
             tensor_type = _parse_tensor_type(type_text)
-            values[name] = builder.input(name, tensor_type.shape, tensor_type.dtype)
+            values[name] = builder.input(
+                name, tensor_type.shape, tensor_type.dtype, tensor_type.layout
+            )
 
     for line_number, line in enumerate(lines[1:-2], start=2):
         match = re.fullmatch(
@@ -356,7 +428,10 @@ def parse_graph(text: str) -> Graph:
             if set(attributes) != {"value"}:
                 raise ValueError("constant requires exactly one 'value' attribute")
             result = builder.constant(
-                attributes["value"], dtype=declared_type.dtype, name=output_name
+                attributes["value"],
+                dtype=declared_type.dtype,
+                name=output_name,
+                layout=declared_type.layout,
             )
         elif op_name == "matmul" and len(operands) == 2 and not attributes:
             result = builder.matmul(operands[0], operands[1], name=output_name)
@@ -371,6 +446,19 @@ def parse_graph(text: str) -> Graph:
         ):
             result = builder.matmul_bias_relu(
                 operands[0], operands[1], operands[2], name=output_name
+            )
+        elif op_name == "conv2d" and len(operands) == 2:
+            if set(attributes) != {"stride", "padding", "dilation"}:
+                raise ValueError(
+                    "conv2d requires stride, padding, and dilation attributes"
+                )
+            result = builder.conv2d(
+                operands[0],
+                operands[1],
+                stride=attributes["stride"],
+                padding=attributes["padding"],
+                dilation=attributes["dilation"],
+                name=output_name,
             )
         else:
             raise ValueError(
@@ -397,18 +485,43 @@ def parse_graph(text: str) -> Graph:
 
 
 def _parse_tensor_type(text: str) -> TensorType:
-    match = _TENSOR_TYPE_PATTERN.fullmatch(text)
+    match = re.fullmatch(r"tensor<(.+)>", text)
     if match is None:
         raise ValueError(f"invalid tensor type: {text!r}")
-    shape_text = match.group("shape")
-    shape = () if shape_text is None else tuple(
-        int(dimension) for dimension in shape_text.split("x")
-    )
+    parts = [part.strip() for part in match.group(1).split(",")]
+    if len(parts) > 2 or (len(parts) == 2 and not parts[1].startswith("layout=")):
+        raise ValueError(f"invalid tensor type: {text!r}")
+    layout = None if len(parts) == 1 else parts[1].split("=", 1)[1]
+    type_parts = parts[0].split("x")
+    dtype_text = type_parts[-1]
+    shape_parts = type_parts[:-1]
+    if any(not part.isdigit() for part in shape_parts):
+        raise ValueError(f"invalid tensor type: {text!r}")
+    shape = tuple(int(dimension) for dimension in shape_parts)
     try:
-        dtype = np.dtype(match.group("dtype"))
+        dtype = np.dtype(dtype_text)
     except TypeError as error:
         raise ValueError(f"unsupported dtype in tensor type: {text!r}") from error
-    return TensorType(shape, dtype)
+    return TensorType(shape, dtype, layout)
+
+
+def _normalize_pair(name: str, value: int | Iterable[int]) -> tuple[int, int]:
+    items = (value, value) if isinstance(value, int) else tuple(value)
+    if len(items) != 2 or any(not isinstance(item, int) or item <= 0 for item in items):
+        raise ValueError(f"{name} must contain two positive integers")
+    return int(items[0]), int(items[1])
+
+
+def _normalize_padding(value: int | Iterable[int]) -> tuple[int, int, int, int]:
+    if isinstance(value, int):
+        items = (value,) * 4
+    else:
+        items = tuple(value)
+        if len(items) == 2:
+            items = (items[0], items[0], items[1], items[1])
+    if len(items) != 4 or any(not isinstance(item, int) or item < 0 for item in items):
+        raise ValueError("padding must contain two or four non-negative integers")
+    return tuple(int(item) for item in items)
 
 
 def _parse_value_references(
@@ -423,6 +536,22 @@ def _parse_value_references(
             raise ValueError(f"invalid value reference {reference.strip()!r} in {context}")
         names.append(match.group(1))
     return names
+
+
+def _split_graph_arguments(text: str) -> list[str]:
+    arguments: list[str] = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(text):
+        if character == "<":
+            depth += 1
+        elif character == ">":
+            depth -= 1
+        elif character == "," and depth == 0:
+            arguments.append(text[start:index].strip())
+            start = index + 1
+    arguments.append(text[start:].strip())
+    return arguments
 
 
 def _format_attributes(attributes: Mapping[str, Any]) -> str:

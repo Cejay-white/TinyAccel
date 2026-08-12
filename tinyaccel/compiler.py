@@ -26,6 +26,9 @@ class CompileOptions:
     tile_m: int = 32
     tile_n: int = 32
     tile_k: int = 32
+    tile_h: int = 8
+    tile_w: int = 8
+    tile_oc: int = 16
     optimize: bool = True
 
     def __post_init__(self) -> None:
@@ -33,6 +36,9 @@ class CompileOptions:
             ("tile_m", self.tile_m),
             ("tile_n", self.tile_n),
             ("tile_k", self.tile_k),
+            ("tile_h", self.tile_h),
+            ("tile_w", self.tile_w),
+            ("tile_oc", self.tile_oc),
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
@@ -108,6 +114,9 @@ def compile(
         tile_m=options.tile_m,
         tile_n=options.tile_n,
         tile_k=options.tile_k,
+        tile_h=options.tile_h,
+        tile_w=options.tile_w,
+        tile_oc=options.tile_oc,
     )
     memory_plan = plan_memory(
         lowered_graph, capacity_bytes=hardware.sram_bytes
@@ -128,6 +137,10 @@ def compile(
             _lower_relu(scheduled, instructions, hardware, memory_plan.total_bytes)
         elif operation.op == "matmul_bias_relu":
             _lower_matmul_bias_relu(
+                scheduled, instructions, hardware, memory_plan.total_bytes
+            )
+        elif operation.op == "conv2d":
+            _lower_conv2d(
                 scheduled, instructions, hardware, memory_plan.total_bytes
             )
         else:
@@ -371,6 +384,89 @@ def _lower_matmul_bias_relu(
             )
 
 
+def _lower_conv2d(
+    scheduled: ScheduledOperation,
+    instructions: list[Instruction],
+    hardware: HardwareConfig,
+    reserved_sram_bytes: int,
+) -> None:
+    operation = scheduled.operation
+    input_value, weight = operation.inputs
+    output = operation.output
+    _, _, _, input_c = input_value.type.shape
+    kernel_h, kernel_w, _, _ = weight.type.shape
+    stride_h, stride_w = operation.attributes["stride"]
+    pad_top, _, pad_left, _ = operation.attributes["padding"]
+    dilation_h, dilation_w = operation.attributes["dilation"]
+    effective_h = (kernel_h - 1) * dilation_h + 1
+    effective_w = (kernel_w - 1) * dilation_w + 1
+    tile_h = scheduled.loop("h").tile
+    tile_w = scheduled.loop("w").tile
+    tile_oc = scheduled.loop("oc").tile
+    n_size, output_h, output_w, output_c = output.type.shape
+
+    for n_offset in range(n_size):
+        for h_offset in range(0, output_h, tile_h):
+            h_extent = min(tile_h, output_h - h_offset)
+            input_h_extent = (h_extent - 1) * stride_h + effective_h
+            input_h_offset = h_offset * stride_h - pad_top
+            for w_offset in range(0, output_w, tile_w):
+                w_extent = min(tile_w, output_w - w_offset)
+                input_w_extent = (w_extent - 1) * stride_w + effective_w
+                input_w_offset = w_offset * stride_w - pad_left
+                for oc_offset in range(0, output_c, tile_oc):
+                    oc_extent = min(tile_oc, output_c - oc_offset)
+                    input_shape = (1, input_h_extent, input_w_extent, input_c)
+                    weight_shape = (kernel_h, kernel_w, input_c, oc_extent)
+                    output_shape = (1, h_extent, w_extent, oc_extent)
+                    required = (
+                        _element_count(input_shape)
+                        + _element_count(weight_shape)
+                        + _element_count(output_shape)
+                    ) * output.type.dtype.itemsize
+                    _require_sram(
+                        required,
+                        hardware,
+                        "conv2d tile",
+                        reserved_sram_bytes,
+                    )
+                    instructions.extend(
+                        (
+                            _load(
+                                input_value.name,
+                                "input",
+                                (n_offset, input_h_offset, input_w_offset, 0),
+                                input_shape,
+                                padded=True,
+                            ),
+                            _load(
+                                weight.name,
+                                "weight",
+                                (0, 0, 0, oc_offset),
+                                weight_shape,
+                            ),
+                            Instruction(
+                                Opcode.ZERO,
+                                {"buffer": "acc", "shape": output_shape},
+                            ),
+                            Instruction(
+                                Opcode.CONV2D,
+                                {
+                                    "input": "input",
+                                    "weight": "weight",
+                                    "accumulator": "acc",
+                                    "stride": (stride_h, stride_w),
+                                    "dilation": (dilation_h, dilation_w),
+                                },
+                            ),
+                            _store(
+                                "acc",
+                                output.name,
+                                (n_offset, h_offset, w_offset, oc_offset),
+                                output_shape,
+                            ),
+                        )
+                    )
 def _output_tiles(
     tensor_type: TensorType, scheduled: ScheduledOperation
 ) -> Iterable[tuple[tuple[int, ...], tuple[int, ...]]]:
@@ -412,11 +508,13 @@ def _load(
     buffer: str,
     offset: tuple[int, ...],
     shape: tuple[int, ...],
+    *,
+    padded: bool = False,
 ) -> Instruction:
-    return Instruction(
-        Opcode.DMA_LOAD,
-        {"source": source, "buffer": buffer, "offset": offset, "shape": shape},
-    )
+    operands = {"source": source, "buffer": buffer, "offset": offset, "shape": shape}
+    if padded:
+        operands["padded"] = True
+    return Instruction(Opcode.DMA_LOAD, operands)
 
 
 def _store(

@@ -94,10 +94,20 @@ def create_schedule(
     tile_m: int = 32,
     tile_n: int = 32,
     tile_k: int = 32,
+    tile_h: int = 8,
+    tile_w: int = 8,
+    tile_oc: int = 16,
 ) -> Schedule:
     """Create the deterministic default schedule for supported operations."""
 
-    for name, value in (("tile_m", tile_m), ("tile_n", tile_n), ("tile_k", tile_k)):
+    for name, value in (
+        ("tile_m", tile_m),
+        ("tile_n", tile_n),
+        ("tile_k", tile_k),
+        ("tile_h", tile_h),
+        ("tile_w", tile_w),
+        ("tile_oc", tile_oc),
+    ):
         if value <= 0:
             raise ValueError(f"{name} must be positive, got {value}")
 
@@ -116,6 +126,19 @@ def create_schedule(
             )
         elif operation.op in {"add", "relu"}:
             loops = _elementwise_loops(operation, tile_m, tile_n)
+        elif operation.op == "conv2d":
+            input_value, weight = operation.inputs
+            n_size, output_h, output_w, output_c = operation.output.type.shape
+            kernel_h, kernel_w, input_c, _ = weight.type.shape
+            loops = (
+                LoopSpec("n", n_size, 1),
+                LoopSpec("h", output_h, min(tile_h, output_h)),
+                LoopSpec("w", output_w, min(tile_w, output_w)),
+                LoopSpec("oc", output_c, min(tile_oc, output_c)),
+                LoopSpec("kh", kernel_h, kernel_h, "reduction"),
+                LoopSpec("kw", kernel_w, kernel_w, "reduction"),
+                LoopSpec("ic", input_c, input_c, "reduction"),
+            )
         else:
             raise NotImplementedError(f"cannot schedule operation {operation.op!r}")
         scheduled.append(ScheduledOperation(operation, loops))

@@ -3,7 +3,6 @@
 from .compiler import CompileOptions, Executable, compile
 from .hardware import HardwareConfig
 from .ir import Graph, GraphBuilder, TensorType, parse_graph
-from .reference import ReferenceExecutor, evaluate
 from .memory import (
     BufferAllocation,
     MemoryPlan,
@@ -11,6 +10,7 @@ from .memory import (
     analyze_lifetimes,
     plan_memory,
 )
+from .reference import ReferenceExecutor, conv2d_nhwc, evaluate
 from .passes import (
     AlgebraicSimplificationPass,
     ConstantFoldingPass,
@@ -46,6 +46,7 @@ __all__ = [
     "ValueLifetime",
     "AlgebraicSimplificationPass",
     "compile",
+    "conv2d_nhwc",
     "create_schedule",
     "evaluate",
     "analyze_lifetimes",

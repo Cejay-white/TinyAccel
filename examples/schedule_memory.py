@@ -11,7 +11,8 @@ def main() -> None:
     rhs = builder.input("rhs", (9, 7))
     product = builder.matmul(lhs, rhs, name="product")
     positive = builder.relu(product, name="positive")
-    graph = builder.build(builder.relu(positive, name="result"))
+    stable = builder.relu(positive, name="stable")
+    graph = builder.build(builder.relu(stable, name="result"))
 
     executable = tinyaccel.compile(
         graph,
@@ -37,9 +38,10 @@ def main() -> None:
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
     first = executable.memory_plan.allocation("product")
-    last = executable.memory_plan.allocation("result")
+    last = executable.memory_plan.allocation("stable")
     print()
-    print(f"Reused SRAM address: product/result -> {first.offset}/{last.offset}")
+    print(f"Reused SRAM address: product/stable -> {first.offset}/{last.offset}")
+    print("Final result residency: DRAM")
     print(f"Measured peak SRAM bytes: {executable.last_report.peak_sram_bytes}")
 
 

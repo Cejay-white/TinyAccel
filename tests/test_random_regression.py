@@ -92,6 +92,7 @@ class RandomizedRegressionTests(unittest.TestCase):
                     tile_h=int(rng.integers(1, 5)),
                     tile_w=int(rng.integers(1, 5)),
                     tile_oc=int(rng.integers(1, 4)),
+                    tile_ic=int(rng.integers(1, 4)),
                 ),
             )
             input_data = rng.standard_normal(input_value.type.shape, dtype=np.float32)

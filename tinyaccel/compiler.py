@@ -10,7 +10,7 @@ import numpy as np
 
 from .hardware import HardwareConfig
 from .ir import Graph, TensorType
-from .isa import Instruction, Opcode, Program
+from .isa import Instruction, MemorySpace, Opcode, Program
 from .memory import MemoryPlan, plan_memory
 from .passes import default_pipeline
 from .schedule import Schedule, ScheduledOperation, create_schedule
@@ -30,6 +30,7 @@ class CompileOptions:
     tile_w: int = 8
     tile_oc: int = 16
     optimize: bool = True
+    tile_ic: int = 16
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -39,6 +40,7 @@ class CompileOptions:
             ("tile_h", self.tile_h),
             ("tile_w", self.tile_w),
             ("tile_oc", self.tile_oc),
+            ("tile_ic", self.tile_ic),
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
@@ -95,12 +97,15 @@ def compile(
     *,
     options: CompileOptions | None = None,
     hardware: HardwareConfig | None = None,
+    schedule: Schedule | None = None,
 ) -> Executable:
     """Compile a supported graph into a tiled TinyAccel program."""
 
     options = options or CompileOptions()
     hardware = hardware or HardwareConfig()
     graph.validate()
+    if schedule is not None and options.optimize:
+        raise ValueError("custom schedule requires CompileOptions(optimize=False)")
     lowered_graph = default_pipeline().run(graph) if options.optimize else graph
 
     if len(lowered_graph.outputs) != 1:
@@ -109,15 +114,19 @@ def compile(
         if value.type.dtype != np.dtype("float32"):
             raise NotImplementedError("accelerator backend currently supports float32")
 
-    schedule = create_schedule(
-        lowered_graph,
-        tile_m=options.tile_m,
-        tile_n=options.tile_n,
-        tile_k=options.tile_k,
-        tile_h=options.tile_h,
-        tile_w=options.tile_w,
-        tile_oc=options.tile_oc,
-    )
+    if schedule is None:
+        schedule = create_schedule(
+            lowered_graph,
+            tile_m=options.tile_m,
+            tile_n=options.tile_n,
+            tile_k=options.tile_k,
+            tile_h=options.tile_h,
+            tile_w=options.tile_w,
+            tile_oc=options.tile_oc,
+            tile_ic=options.tile_ic,
+        )
+    elif schedule.graph is not lowered_graph:
+        raise ValueError("custom schedule must target the graph being compiled")
     memory_plan = plan_memory(
         lowered_graph, capacity_bytes=hardware.sram_bytes
     )
@@ -156,16 +165,26 @@ def compile(
         value.name: (value.type.shape, value.type.dtype)
         for value in lowered_graph.values
     }
+    value_spaces = {
+        value.name: (
+            MemorySpace.SRAM
+            if value.name in memory_plan.allocations
+            else MemorySpace.DRAM
+        )
+        for value in lowered_graph.values
+    }
+    instructions = _annotate_dma_spaces(instructions, value_spaces)
     output = lowered_graph.outputs[0]
     program = Program(
-        tuple(instructions),
-        input_types,
-        output.name,
-        output.type.shape,
-        output.type.dtype,
-        value_types,
-        constants,
-        memory_plan,
+        instructions=tuple(instructions),
+        input_types=input_types,
+        output_name=output.name,
+        output_shape=output.type.shape,
+        output_dtype=output.type.dtype,
+        value_types=value_types,
+        value_spaces=value_spaces,
+        constants=constants,
+        memory_plan=memory_plan,
     )
     return Executable(program, hardware, lowered_graph, schedule, memory_plan)
 
@@ -403,6 +422,7 @@ def _lower_conv2d(
     tile_h = scheduled.loop("h").tile
     tile_w = scheduled.loop("w").tile
     tile_oc = scheduled.loop("oc").tile
+    tile_ic = scheduled.loop("ic").tile
     n_size, output_h, output_w, output_c = output.type.shape
 
     for n_offset in range(n_size):
@@ -416,12 +436,23 @@ def _lower_conv2d(
                 input_w_offset = w_offset * stride_w - pad_left
                 for oc_offset in range(0, output_c, tile_oc):
                     oc_extent = min(tile_oc, output_c - oc_offset)
-                    input_shape = (1, input_h_extent, input_w_extent, input_c)
-                    weight_shape = (kernel_h, kernel_w, input_c, oc_extent)
                     output_shape = (1, h_extent, w_extent, oc_extent)
+                    max_ic_extent = min(tile_ic, input_c)
+                    max_input_shape = (
+                        1,
+                        input_h_extent,
+                        input_w_extent,
+                        max_ic_extent,
+                    )
+                    max_weight_shape = (
+                        kernel_h,
+                        kernel_w,
+                        max_ic_extent,
+                        oc_extent,
+                    )
                     required = (
-                        _element_count(input_shape)
-                        + _element_count(weight_shape)
+                        _element_count(max_input_shape)
+                        + _element_count(max_weight_shape)
                         + _element_count(output_shape)
                     ) * output.type.dtype.itemsize
                     _require_sram(
@@ -430,43 +461,68 @@ def _lower_conv2d(
                         "conv2d tile",
                         reserved_sram_bytes,
                     )
-                    instructions.extend(
-                        (
-                            _load(
-                                input_value.name,
-                                "input",
-                                (n_offset, input_h_offset, input_w_offset, 0),
-                                input_shape,
-                                padded=True,
-                            ),
-                            _load(
-                                weight.name,
-                                "weight",
-                                (0, 0, 0, oc_offset),
-                                weight_shape,
-                            ),
-                            Instruction(
-                                Opcode.ZERO,
-                                {"buffer": "acc", "shape": output_shape},
-                            ),
-                            Instruction(
-                                Opcode.CONV2D,
-                                {
-                                    "input": "input",
-                                    "weight": "weight",
-                                    "accumulator": "acc",
-                                    "stride": (stride_h, stride_w),
-                                    "dilation": (dilation_h, dilation_w),
-                                },
-                            ),
-                            _store(
-                                "acc",
-                                output.name,
-                                (n_offset, h_offset, w_offset, oc_offset),
-                                output_shape,
-                            ),
+                    instructions.append(
+                        Instruction(
+                            Opcode.ZERO,
+                            {"buffer": "acc", "shape": output_shape},
                         )
                     )
+                    for ic_offset in range(0, input_c, tile_ic):
+                        ic_extent = min(tile_ic, input_c - ic_offset)
+                        input_shape = (
+                            1,
+                            input_h_extent,
+                            input_w_extent,
+                            ic_extent,
+                        )
+                        weight_shape = (
+                            kernel_h,
+                            kernel_w,
+                            ic_extent,
+                            oc_extent,
+                        )
+                        instructions.extend(
+                            (
+                                _load(
+                                    input_value.name,
+                                    "input",
+                                    (
+                                        n_offset,
+                                        input_h_offset,
+                                        input_w_offset,
+                                        ic_offset,
+                                    ),
+                                    input_shape,
+                                    padded=True,
+                                ),
+                                _load(
+                                    weight.name,
+                                    "weight",
+                                    (0, 0, ic_offset, oc_offset),
+                                    weight_shape,
+                                ),
+                                Instruction(
+                                    Opcode.CONV2D,
+                                    {
+                                        "input": "input",
+                                        "weight": "weight",
+                                        "accumulator": "acc",
+                                        "stride": (stride_h, stride_w),
+                                        "dilation": (dilation_h, dilation_w),
+                                    },
+                                ),
+                            )
+                        )
+                    instructions.append(
+                        _store(
+                            "acc",
+                            output.name,
+                            (n_offset, h_offset, w_offset, oc_offset),
+                            output_shape,
+                        )
+                    )
+
+
 def _output_tiles(
     tensor_type: TensorType, scheduled: ScheduledOperation
 ) -> Iterable[tuple[tuple[int, ...], tuple[int, ...]]]:
@@ -531,6 +587,25 @@ def _store(
 
 def _element_count(shape: tuple[int, ...]) -> int:
     return int(np.prod(shape, dtype=np.int64)) if shape else 1
+
+
+def _annotate_dma_spaces(
+    instructions: list[Instruction],
+    value_spaces: dict[str, MemorySpace],
+) -> list[Instruction]:
+    annotated: list[Instruction] = []
+    for instruction in instructions:
+        if instruction.opcode is Opcode.DMA_LOAD:
+            value_name = instruction.operands["source"]
+        elif instruction.opcode is Opcode.DMA_STORE:
+            value_name = instruction.operands["output"]
+        else:
+            annotated.append(instruction)
+            continue
+        operands = dict(instruction.operands)
+        operands["space"] = value_spaces[value_name].value
+        annotated.append(Instruction(instruction.opcode, operands))
+    return annotated
 
 
 def _require_sram(

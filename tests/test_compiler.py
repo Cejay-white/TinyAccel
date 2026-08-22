@@ -39,8 +39,8 @@ class CompilerTests(unittest.TestCase):
         executable = tinyaccel.compile(
             build_matmul(2, 2, 2),
             options=tinyaccel.CompileOptions(tile_m=64, tile_n=64, tile_k=64),
-            # 64 aligned bytes for the planned output plus 48 bytes of tile SRAM.
-            hardware=tinyaccel.HardwareConfig(sram_bytes=112),
+            # The external output needs no arena allocation; the edge tile is 48B.
+            hardware=tinyaccel.HardwareConfig(sram_bytes=48),
         )
 
         self.assertEqual(len(executable.program.instructions), 5)
@@ -147,7 +147,42 @@ class SimulatorTests(unittest.TestCase):
 
         np.testing.assert_array_equal(executable.run(data), data + 2.5)
 
-    def test_fusion_reduces_dram_traffic_and_cycles(self) -> None:
+    def test_dma_traffic_distinguishes_dram_and_sram_residency(self) -> None:
+        builder = tinyaccel.GraphBuilder()
+        value = builder.input("value", (4,))
+        intermediate = builder.relu(value, name="intermediate")
+        graph = builder.build(builder.relu(intermediate, name="result"))
+        executable = tinyaccel.compile(
+            graph, options=tinyaccel.CompileOptions(optimize=False)
+        )
+
+        result = executable.run(np.arange(4, dtype=np.float32) - 2)
+
+        np.testing.assert_array_equal(
+            result, np.array([0, 0, 0, 1], dtype=np.float32)
+        )
+        self.assertEqual(
+            executable.program.value_spaces["value"], tinyaccel.MemorySpace.DRAM
+        )
+        self.assertEqual(
+            executable.program.value_spaces["intermediate"],
+            tinyaccel.MemorySpace.SRAM,
+        )
+        self.assertEqual(
+            executable.program.value_spaces["result"], tinyaccel.MemorySpace.DRAM
+        )
+        dma_spaces = [
+            instruction.operands["space"]
+            for instruction in executable.program.instructions
+            if instruction.opcode in {Opcode.DMA_LOAD, Opcode.DMA_STORE}
+        ]
+        self.assertEqual(dma_spaces, ["DRAM", "SRAM", "SRAM", "DRAM"])
+        self.assertEqual(executable.last_report.dram_bytes_read, 16)
+        self.assertEqual(executable.last_report.dram_bytes_written, 16)
+        self.assertEqual(executable.last_report.sram_bytes_read, 48)
+        self.assertEqual(executable.last_report.sram_bytes_written, 48)
+
+    def test_fusion_reduces_sram_traffic_and_cycles(self) -> None:
         builder = tinyaccel.GraphBuilder()
         lhs = builder.input("lhs", (16, 12))
         rhs = builder.input("rhs", (12, 10))
@@ -174,9 +209,17 @@ class SimulatorTests(unittest.TestCase):
 
         np.testing.assert_allclose(fused_result, unfused_result, rtol=1e-5, atol=1e-5)
         self.assertEqual([op.op for op in fused.graph.operations], ["matmul_bias_relu"])
-        self.assertLess(
+        self.assertEqual(
             fused.last_report.dram_bytes_written,
             unfused.last_report.dram_bytes_written,
+        )
+        self.assertLess(
+            fused.last_report.sram_bytes_read,
+            unfused.last_report.sram_bytes_read,
+        )
+        self.assertLess(
+            fused.last_report.sram_bytes_written,
+            unfused.last_report.sram_bytes_written,
         )
         self.assertLess(fused.last_report.total_cycles, unfused.last_report.total_cycles)
 

@@ -75,7 +75,9 @@ DMA_STORE  instructions=6    cycles=144
 Total cycles:       1722
 DRAM bytes read:    26880
 DRAM bytes written: 4608
-Peak SRAM bytes:    6656
+SRAM bytes read:    4608
+SRAM bytes written: 26880
+Peak SRAM bytes:    2048
 ```
 
 The simulator currently models instructions sequentially. Cycle counts are an
@@ -111,9 +113,10 @@ cycles 0                                      1722
 - Constant folding, algebraic simplification, and dead-code elimination
 - MatMul + bias + ReLU operator fusion
 - GraphViz DOT graph export
-- Configurable M/N/K tiling
+- Configurable MatMul M/N/K and Conv2D H/W/OC/IC tiling
 - Explicit spatial/reduction loop schedules used by ISA lowering
 - Conv2D schedules over `N/H/W/OC` and reductions over `KH/KW/IC`
+- Partial Conv2D accumulation across configurable input-channel tiles
 - SSA value lifetime analysis
 - Alignment-aware linear-scan SRAM planning with buffer reuse
 - Arena-backed simulation of planned intermediate tensors
@@ -121,7 +124,7 @@ cycles 0                                      1722
 - Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, `ADD`, `RELU`, `CONV2D`, and
   `DMA_STORE` instructions
 - Functional accelerator simulation checked against NumPy
-- Cycle, DRAM traffic, and peak SRAM reporting
+- Cycle, DRAM/SRAM transfer traffic, and peak SRAM reporting
 - Per-instruction cycle events and an ASCII execution timeline
 - Hardware configuration and compile-time SRAM capacity checking
 
@@ -138,7 +141,7 @@ Constant Folding
 
 Use `CompileOptions(optimize=False)` to inspect the unoptimized program. The
 fusion example verifies both versions against NumPy and compares instructions,
-cycles, and DRAM traffic:
+cycles, and DRAM/SRAM transfer traffic:
 
 ```bash
 python -m examples.fusion
@@ -165,11 +168,42 @@ print(compiled.schedule)
 print(compiled.memory_plan)
 ```
 
+Custom schedules can be passed directly to compilation. Graph optimization
+must be disabled so the scheduled operations remain identical to the graph
+being lowered:
+
+```python
+custom_schedule = tinyaccel.create_schedule(
+    graph, tile_m=8, tile_n=8, tile_k=4
+)
+custom = tinyaccel.compile(
+    graph,
+    options=tinyaccel.CompileOptions(optimize=False),
+    schedule=custom_schedule,
+)
+```
+
 Schedules describe spatial and reduction loops, their extents, tile sizes, and
 tile counts. The memory planner computes each SSA result's live interval and
 uses first-fit allocation to reuse aligned SRAM arena ranges whose lifetimes do
-not overlap. Inputs and constants remain external/immutable; generated tensor
-results are views into the planned arena used by the simulator.
+not overlap. Inputs, constants, and final graph outputs reside in DRAM;
+non-output intermediate results are views into the SRAM arena used by the
+simulator. Pass `materialize_outputs=True` to `plan_memory` for standalone
+experiments that also retain graph outputs in the arena.
+
+DMA instructions expose the persistent value's memory space as `space=DRAM` or
+`space=SRAM`. Reported SRAM traffic covers the DMA-side movement through local
+tile buffers and the planned arena; it does not yet include compute-unit SRAM
+accesses made internally by MatMul, Conv2D, Add, or ReLU.
+
+For Conv2D, `CompileOptions(tile_ic=...)` controls reduction tiling over input
+channels. Each output tile is zeroed once, accumulates all IC partial results,
+and is stored once. This allows high-channel convolutions to run within a small
+SRAM capacity without changing graph semantics.
+
+Schedule construction validates the exact axis order, extent, and
+spatial/reduction kind required by each operation. Tiles must not exceed their
+loop extents, and scheduled operations must match graph program order.
 
 ## Run tests
 

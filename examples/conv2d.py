@@ -20,7 +20,9 @@ def main() -> None:
     )
     executable = tinyaccel.compile(
         graph,
-        options=tinyaccel.CompileOptions(tile_h=2, tile_w=4, tile_oc=2),
+        options=tinyaccel.CompileOptions(
+            tile_h=2, tile_w=4, tile_oc=2, tile_ic=1
+        ),
     )
 
     print("Graph IR")

@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 
@@ -116,7 +115,7 @@ class Conv2dBackendTests(unittest.TestCase):
     def test_schedule_contains_spatial_and_reduction_axes(self) -> None:
         graph = build_conv2d()
         schedule = tinyaccel.create_schedule(
-            graph, tile_h=2, tile_w=3, tile_oc=2
+            graph, tile_h=2, tile_w=3, tile_oc=2, tile_ic=1
         )
         scheduled = schedule.operations[0]
 
@@ -131,6 +130,8 @@ class Conv2dBackendTests(unittest.TestCase):
                 for axis in ("kh", "kw", "ic")
             )
         )
+        self.assertEqual(scheduled.loop("ic").tile, 1)
+        self.assertEqual(scheduled.loop("ic").tiles, 2)
 
     def test_tiled_isa_matches_reference_with_halo_padding(self) -> None:
         graph = build_conv2d(
@@ -157,8 +158,13 @@ class Conv2dBackendTests(unittest.TestCase):
             * executable.schedule.operations[0].loop("w").tiles
             * executable.schedule.operations[0].loop("oc").tiles
         )
-        self.assertEqual(opcodes.count(Opcode.CONV2D), tile_count)
-        self.assertEqual(opcodes.count(Opcode.DMA_LOAD), 2 * tile_count)
+        reduction_tiles = executable.schedule.operations[0].loop("ic").tiles
+        self.assertEqual(opcodes.count(Opcode.CONV2D), tile_count * reduction_tiles)
+        self.assertEqual(
+            opcodes.count(Opcode.DMA_LOAD), 2 * tile_count * reduction_tiles
+        )
+        self.assertEqual(opcodes.count(Opcode.ZERO), tile_count)
+        self.assertEqual(opcodes.count(Opcode.DMA_STORE), tile_count)
         self.assertEqual(executable.last_report.dram_bytes_written, expected.nbytes)
         self.assertLessEqual(
             executable.last_report.peak_sram_bytes,
@@ -180,24 +186,64 @@ class Conv2dBackendTests(unittest.TestCase):
                         tinyaccel.LoopSpec("oc", 4, 4),
                         tinyaccel.LoopSpec("kh", 3, 3, "reduction"),
                         tinyaccel.LoopSpec("kw", 2, 2, "reduction"),
-                        tinyaccel.LoopSpec("ic", 2, 2, "reduction"),
+                        tinyaccel.LoopSpec("ic", 2, 1, "reduction"),
                     ),
                 ),
             ),
         )
 
-        with patch(
-            "tinyaccel.compiler.create_schedule", return_value=custom_schedule
-        ):
-            executable = tinyaccel.compile(
-                graph,
-                options=tinyaccel.CompileOptions(
-                    tile_h=3, tile_w=6, tile_oc=1, optimize=False
-                ),
-            )
+        executable = tinyaccel.compile(
+            graph,
+            options=tinyaccel.CompileOptions(
+                tile_h=3, tile_w=6, tile_oc=1, optimize=False
+            ),
+            schedule=custom_schedule,
+        )
 
         opcodes = [instruction.opcode for instruction in executable.program.instructions]
-        self.assertEqual(opcodes.count(Opcode.CONV2D), 9)
+        self.assertEqual(opcodes.count(Opcode.CONV2D), 18)
+        self.assertEqual(opcodes.count(Opcode.ZERO), 9)
+        self.assertEqual(opcodes.count(Opcode.DMA_STORE), 9)
+
+    def test_ic_tiling_runs_large_channel_conv2d_in_small_sram(self) -> None:
+        graph = build_conv2d(
+            input_shape=(1, 1, 1, 1024),
+            weight_shape=(1, 1, 1024, 1),
+        )
+        hardware = tinyaccel.HardwareConfig(sram_bytes=4096)
+
+        with self.assertRaisesRegex(ValueError, "conv2d tile requires"):
+            tinyaccel.compile(
+                graph,
+                options=tinyaccel.CompileOptions(tile_ic=1024),
+                hardware=hardware,
+            )
+
+        executable = tinyaccel.compile(
+            graph,
+            options=tinyaccel.CompileOptions(tile_ic=32),
+            hardware=hardware,
+        )
+        input_data = np.linspace(-1, 1, 1024, dtype=np.float32).reshape(
+            1, 1, 1, 1024
+        )
+        weight_data = np.linspace(1, -1, 1024, dtype=np.float32).reshape(
+            1, 1, 1024, 1
+        )
+
+        actual = executable.run(input_data, weight_data)
+        expected = tinyaccel.evaluate(graph, input_data, weight_data)
+
+        np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
+        opcodes = [item.opcode for item in executable.program.instructions]
+        self.assertEqual(executable.schedule.operations[0].loop("ic").tiles, 32)
+        self.assertEqual(opcodes.count(Opcode.ZERO), 1)
+        self.assertEqual(opcodes.count(Opcode.CONV2D), 32)
+        self.assertEqual(opcodes.count(Opcode.DMA_LOAD), 64)
+        self.assertEqual(opcodes.count(Opcode.DMA_STORE), 1)
+        self.assertLessEqual(
+            executable.last_report.peak_sram_bytes, hardware.sram_bytes
+        )
 
     def test_padding_halo_does_not_count_as_dram_traffic(self) -> None:
         graph = build_conv2d(
@@ -219,9 +265,13 @@ class Conv2dBackendTests(unittest.TestCase):
         self.assertEqual(executable.last_report.dram_bytes_read, (4 + 9) * 4)
 
     def test_conv2d_rejects_plan_plus_tile_sram_overflow(self) -> None:
-        graph = build_conv2d(
-            input_shape=(1, 4, 4, 1), weight_shape=(3, 3, 1, 2), padding=1
+        builder = tinyaccel.GraphBuilder()
+        input_value = builder.input("input", (1, 4, 4, 1), layout="NHWC")
+        weight = builder.input("weight", (3, 3, 1, 2), layout="HWIO")
+        convolution = builder.conv2d(
+            input_value, weight, padding=1, name="convolution"
         )
+        graph = builder.build(builder.relu(convolution, name="output"))
 
         with self.assertRaisesRegex(ValueError, "conv2d tile requires"):
             tinyaccel.compile(

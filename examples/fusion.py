@@ -53,6 +53,16 @@ for name, before, after in (
         unfused.last_report.dram_bytes_written,
         fused.last_report.dram_bytes_written,
     ),
+    (
+        "SRAM bytes read",
+        unfused.last_report.sram_bytes_read,
+        fused.last_report.sram_bytes_read,
+    ),
+    (
+        "SRAM bytes written",
+        unfused.last_report.sram_bytes_written,
+        fused.last_report.sram_bytes_written,
+    ),
 ):
     reduction = 0.0 if before == 0 else 100.0 * (before - after) / before
     print(f"{name:<22}{before:>12}{after:>12}{reduction:>11.1f}%")

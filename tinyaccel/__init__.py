@@ -2,6 +2,7 @@
 
 from .compiler import CompileOptions, Executable, compile
 from .hardware import HardwareConfig
+from .isa import MemorySpace
 from .ir import Graph, GraphBuilder, TensorType, parse_graph
 from .memory import (
     BufferAllocation,
@@ -33,6 +34,7 @@ __all__ = [
     "GraphBuilder",
     "HardwareConfig",
     "MatmulBiasReluFusionPass",
+    "MemorySpace",
     "MemoryPlan",
     "PassManager",
     "PassResult",

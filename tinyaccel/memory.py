@@ -136,8 +136,14 @@ def plan_memory(
     *,
     alignment: int = 64,
     capacity_bytes: int | None = None,
+    materialize_outputs: bool = False,
 ) -> MemoryPlan:
-    """Allocate operation results in SRAM with first-fit lifetime reuse."""
+    """Allocate intermediate results in SRAM with first-fit lifetime reuse.
+
+    Graph outputs remain external by default so compiled programs can DMA their
+    final tiles directly to DRAM. Set ``materialize_outputs`` to retain outputs
+    in the SRAM arena for standalone memory-planning experiments.
+    """
 
     if alignment <= 0:
         raise ValueError(f"alignment must be positive, got {alignment}")
@@ -148,10 +154,11 @@ def plan_memory(
     constants = {
         operation.output for operation in graph.operations if operation.op == "constant"
     }
+    external_outputs = set() if materialize_outputs else set(graph.outputs)
     materialized = [
         operation.output
         for operation in graph.operations
-        if operation.output not in constants
+        if operation.output not in constants and operation.output not in external_outputs
     ]
     allocations: dict[str, BufferAllocation] = {}
     active: list[BufferAllocation] = []

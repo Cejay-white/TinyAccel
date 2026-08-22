@@ -22,6 +22,13 @@ class Opcode(str, Enum):
     DMA_STORE = "DMA_STORE"
 
 
+class MemorySpace(str, Enum):
+    """Persistent memory spaces visible to DMA instructions."""
+
+    DRAM = "DRAM"
+    SRAM = "SRAM"
+
+
 @dataclass(frozen=True)
 class Instruction:
     opcode: Opcode
@@ -44,6 +51,7 @@ class Program:
     )
     constants: Mapping[str, np.ndarray] = field(default_factory=dict)
     memory_plan: MemoryPlan | None = None
+    value_spaces: Mapping[str, MemorySpace] = field(default_factory=dict)
 
     def __str__(self) -> str:
         return "\n".join(

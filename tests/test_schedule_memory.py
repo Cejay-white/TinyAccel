@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 
@@ -61,18 +60,91 @@ class ScheduleTests(unittest.TestCase):
             ),
         )
 
-        with patch("tinyaccel.compiler.create_schedule", return_value=scheduled):
-            executable = tinyaccel.compile(
-                graph,
-                options=tinyaccel.CompileOptions(
-                    tile_m=5, tile_n=1, tile_k=1, optimize=False
-                ),
-            )
+        executable = tinyaccel.compile(
+            graph,
+            options=tinyaccel.CompileOptions(
+                tile_m=5, tile_n=1, tile_k=1, optimize=False
+            ),
+            schedule=scheduled,
+        )
 
         opcodes = [item.opcode for item in executable.program.instructions]
         # The injected schedule has 3 M tiles, 1 N tile, and 2 K tiles.
         self.assertEqual(opcodes.count(Opcode.ZERO), 3)
         self.assertEqual(opcodes.count(Opcode.MATMUL), 6)
+
+    def test_rejects_malformed_matmul_loop_schemas(self) -> None:
+        builder = tinyaccel.GraphBuilder()
+        lhs = builder.input("lhs", (5, 7))
+        rhs = builder.input("rhs", (7, 3))
+        graph = builder.build(builder.matmul(lhs, rhs))
+        operation = graph.operations[0]
+        malformed = (
+            (
+                "axes",
+                (
+                    tinyaccel.LoopSpec("n", 3, 3),
+                    tinyaccel.LoopSpec("m", 5, 2),
+                    tinyaccel.LoopSpec("k", 7, 4, "reduction"),
+                ),
+            ),
+            (
+                "extent",
+                (
+                    tinyaccel.LoopSpec("m", 4, 2),
+                    tinyaccel.LoopSpec("n", 3, 3),
+                    tinyaccel.LoopSpec("k", 7, 4, "reduction"),
+                ),
+            ),
+            (
+                "kind",
+                (
+                    tinyaccel.LoopSpec("m", 5, 2),
+                    tinyaccel.LoopSpec("n", 3, 3),
+                    tinyaccel.LoopSpec("k", 7, 4),
+                ),
+            ),
+        )
+
+        for message, loops in malformed:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    tinyaccel.ScheduledOperation(operation, loops)
+
+    def test_rejects_oversized_tiles_and_out_of_order_operations(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exceeds extent"):
+            tinyaccel.LoopSpec("m", 4, 5)
+
+        builder = tinyaccel.GraphBuilder()
+        value = builder.input("value", (4,))
+        first = builder.relu(value, name="first")
+        graph = builder.build(builder.relu(first, name="output"))
+        schedule = tinyaccel.create_schedule(graph)
+
+        with self.assertRaisesRegex(ValueError, "program order"):
+            tinyaccel.Schedule(graph, tuple(reversed(schedule.operations)))
+
+    def test_custom_schedule_compile_contract(self) -> None:
+        builder = tinyaccel.GraphBuilder()
+        lhs = builder.input("lhs", (2, 3))
+        rhs = builder.input("rhs", (3, 4))
+        graph = builder.build(builder.matmul(lhs, rhs))
+        schedule = tinyaccel.create_schedule(graph)
+
+        with self.assertRaisesRegex(ValueError, "optimize=False"):
+            tinyaccel.compile(graph, schedule=schedule)
+
+        other_builder = tinyaccel.GraphBuilder()
+        other_lhs = other_builder.input("lhs", (2, 3))
+        other_rhs = other_builder.input("rhs", (3, 4))
+        other_graph = other_builder.build(other_builder.matmul(other_lhs, other_rhs))
+        other_schedule = tinyaccel.create_schedule(other_graph)
+        with self.assertRaisesRegex(ValueError, "graph being compiled"):
+            tinyaccel.compile(
+                graph,
+                options=tinyaccel.CompileOptions(optimize=False),
+                schedule=other_schedule,
+            )
 
 
 class MemoryPlanningTests(unittest.TestCase):
@@ -99,13 +171,21 @@ class MemoryPlanningTests(unittest.TestCase):
         value = builder.input("value", (16,))
         first = builder.relu(value, name="first")
         second = builder.relu(first, name="second")
-        output = builder.relu(second, name="output")
+        third = builder.relu(second, name="third")
+        output = builder.relu(third, name="output")
         graph = builder.build(output)
 
         plan = tinyaccel.plan_memory(graph)
 
-        self.assertEqual(plan.allocation("first").offset, plan.allocation("output").offset)
-        self.assertNotEqual(plan.allocation("first").offset, plan.allocation("second").offset)
+        self.assertEqual(
+            plan.allocation("first").offset, plan.allocation("third").offset
+        )
+        self.assertNotEqual(
+            plan.allocation("first").offset, plan.allocation("second").offset
+        )
+        self.assertNotIn("output", plan.allocations)
+        materialized = tinyaccel.plan_memory(graph, materialize_outputs=True)
+        self.assertIn("output", materialized.allocations)
         self.assertEqual(plan.total_bytes, 128)
         self.assertTrue(
             all(
@@ -117,7 +197,8 @@ class MemoryPlanningTests(unittest.TestCase):
     def test_plan_rejects_sram_capacity_overflow(self) -> None:
         builder = tinyaccel.GraphBuilder()
         value = builder.input("value", (17,))
-        graph = builder.build(builder.relu(value, name="output"))
+        intermediate = builder.relu(value, name="intermediate")
+        graph = builder.build(builder.relu(intermediate, name="output"))
 
         with self.assertRaisesRegex(ValueError, "requires 128 SRAM bytes"):
             tinyaccel.plan_memory(graph, capacity_bytes=64)
@@ -126,7 +207,8 @@ class MemoryPlanningTests(unittest.TestCase):
         builder = tinyaccel.GraphBuilder()
         lhs = builder.input("lhs", (2, 2))
         rhs = builder.input("rhs", (2, 2))
-        graph = builder.build(builder.matmul(lhs, rhs))
+        product = builder.matmul(lhs, rhs)
+        graph = builder.build(builder.relu(product))
 
         with self.assertRaisesRegex(ValueError, "48 SRAM bytes plus 64 planned"):
             tinyaccel.compile(
@@ -139,7 +221,8 @@ class MemoryPlanningTests(unittest.TestCase):
         value = builder.input("value", (3, 5))
         first = builder.relu(value, name="first")
         second = builder.relu(first, name="second")
-        graph = builder.build(builder.relu(second, name="output"))
+        third = builder.relu(second, name="third")
+        graph = builder.build(builder.relu(third, name="output"))
         executable = tinyaccel.compile(
             graph,
             options=tinyaccel.CompileOptions(optimize=False, tile_m=2, tile_n=3),
@@ -150,8 +233,9 @@ class MemoryPlanningTests(unittest.TestCase):
         self.assertIs(executable.program.memory_plan, executable.memory_plan)
         self.assertEqual(
             executable.memory_plan.allocation("first").offset,
-            executable.memory_plan.allocation("output").offset,
+            executable.memory_plan.allocation("third").offset,
         )
+        self.assertNotIn("output", executable.memory_plan.allocations)
         self.assertEqual(
             executable.last_report.peak_sram_bytes,
             executable.memory_plan.total_bytes + 2 * 2 * 3 * 4,
@@ -160,7 +244,8 @@ class MemoryPlanningTests(unittest.TestCase):
     def test_simulator_rejects_peak_above_hardware_capacity(self) -> None:
         builder = tinyaccel.GraphBuilder()
         value = builder.input("value", (3, 5))
-        graph = builder.build(builder.relu(value, name="output"))
+        intermediate = builder.relu(value, name="intermediate")
+        graph = builder.build(builder.relu(intermediate, name="output"))
         executable = tinyaccel.compile(
             graph,
             options=tinyaccel.CompileOptions(tile_m=2, tile_n=3),

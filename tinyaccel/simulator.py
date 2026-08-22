@@ -10,7 +10,7 @@ from typing import Mapping
 import numpy as np
 
 from .hardware import HardwareConfig
-from .isa import Instruction, Opcode, Program
+from .isa import Instruction, MemorySpace, Opcode, Program
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,8 @@ class SimulationReport:
     dram_bytes_written: int
     peak_sram_bytes: int
     timeline: tuple[TimelineEvent, ...]
+    sram_bytes_read: int = 0
+    sram_bytes_written: int = 0
 
     def __str__(self) -> str:
         lines = ["TinyAccel Simulation Report", "=" * 28]
@@ -49,6 +51,8 @@ class SimulationReport:
                 f"Total cycles:       {self.total_cycles}",
                 f"DRAM bytes read:    {self.dram_bytes_read}",
                 f"DRAM bytes written: {self.dram_bytes_written}",
+                f"SRAM bytes read:    {self.sram_bytes_read}",
+                f"SRAM bytes written: {self.sram_bytes_written}",
                 f"Peak SRAM bytes:    {self.peak_sram_bytes}",
             )
         )
@@ -132,8 +136,10 @@ class Simulator:
         buffers: dict[str, np.ndarray] = {}
         instruction_counts: Counter[str] = Counter()
         cycles_by_opcode: Counter[str] = Counter()
-        bytes_read = 0
-        bytes_written = 0
+        dram_bytes_read = 0
+        dram_bytes_written = 0
+        sram_bytes_read = 0
+        sram_bytes_written = 0
         planned_sram_bytes = 0 if arena is None else arena.nbytes
         peak_sram_bytes = planned_sram_bytes
         if peak_sram_bytes > self.hardware.sram_bytes:
@@ -146,7 +152,7 @@ class Simulator:
 
         for index, instruction in enumerate(program.instructions):
             instruction_counts[instruction.opcode.value] += 1
-            cycles, read, written = self._execute(
+            cycles, dram_read, dram_written, sram_read, sram_written = self._execute(
                 instruction, memory, buffers
             )
             cycles_by_opcode[instruction.opcode.value] += cycles
@@ -159,8 +165,10 @@ class Simulator:
                 )
             )
             current_cycle += cycles
-            bytes_read += read
-            bytes_written += written
+            dram_bytes_read += dram_read
+            dram_bytes_written += dram_written
+            sram_bytes_read += sram_read
+            sram_bytes_written += sram_written
             current_sram = planned_sram_bytes + sum(
                 buffer.nbytes for buffer in buffers.values()
             )
@@ -172,13 +180,15 @@ class Simulator:
                 )
 
         report = SimulationReport(
-            sum(cycles_by_opcode.values()),
-            dict(instruction_counts),
-            dict(cycles_by_opcode),
-            bytes_read,
-            bytes_written,
-            peak_sram_bytes,
-            tuple(timeline),
+            total_cycles=sum(cycles_by_opcode.values()),
+            instruction_counts=dict(instruction_counts),
+            cycles_by_opcode=dict(cycles_by_opcode),
+            dram_bytes_read=dram_bytes_read,
+            dram_bytes_written=dram_bytes_written,
+            peak_sram_bytes=peak_sram_bytes,
+            timeline=tuple(timeline),
+            sram_bytes_read=sram_bytes_read,
+            sram_bytes_written=sram_bytes_written,
         )
         return memory[program.output_name], report
 
@@ -187,14 +197,14 @@ class Simulator:
         instruction: Instruction,
         memory: dict[str, np.ndarray],
         buffers: dict[str, np.ndarray],
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, int, int]:
         operands = instruction.operands
 
         if instruction.opcode is Opcode.ZERO:
             buffer = np.zeros(operands["shape"], dtype=np.float32)
             buffers[operands["buffer"]] = buffer
             cycles = ceil(buffer.size / self.hardware.macs_per_cycle)
-            return cycles, 0, 0
+            return cycles, 0, 0, 0, 0
 
         if instruction.opcode is Opcode.DMA_LOAD:
             source = memory[operands["source"]]
@@ -207,7 +217,10 @@ class Simulator:
                 transferred_bytes = tile.nbytes
             buffers[operands["buffer"]] = tile
             cycles = ceil(transferred_bytes / self.hardware.dma_bytes_per_cycle)
-            return cycles, transferred_bytes, 0
+            source_space = MemorySpace(operands["space"])
+            dram_read = transferred_bytes if source_space is MemorySpace.DRAM else 0
+            sram_read = transferred_bytes if source_space is MemorySpace.SRAM else 0
+            return cycles, dram_read, 0, sram_read, tile.nbytes
 
         if instruction.opcode is Opcode.MATMUL:
             lhs = buffers[operands["lhs"]]
@@ -215,20 +228,20 @@ class Simulator:
             accumulator = buffers[operands["accumulator"]]
             accumulator += lhs @ rhs
             macs = lhs.shape[0] * rhs.shape[1] * lhs.shape[1]
-            return ceil(macs / self.hardware.macs_per_cycle), 0, 0
+            return ceil(macs / self.hardware.macs_per_cycle), 0, 0, 0, 0
 
         if instruction.opcode is Opcode.ADD:
             result = buffers[operands["lhs"]] + buffers[operands["rhs"]]
             buffers[operands["output"]] = np.asarray(result, dtype=np.float32)
             cycles = ceil(result.size / self.hardware.macs_per_cycle)
-            return cycles, 0, 0
+            return cycles, 0, 0, 0, 0
 
         if instruction.opcode is Opcode.RELU:
             source = buffers[operands["input"]]
             result = np.maximum(source, 0)
             buffers[operands["output"]] = result
             cycles = ceil(result.size / self.hardware.macs_per_cycle)
-            return cycles, 0, 0
+            return cycles, 0, 0, 0, 0
 
         if instruction.opcode is Opcode.CONV2D:
             input_tile = buffers[operands["input"]]
@@ -254,7 +267,7 @@ class Simulator:
                         patch, weight, axes=((0, 1, 2), (0, 1, 2))
                     )
             macs = output_h * output_w * output_c * kernel_h * kernel_w * input_c
-            return ceil(macs / self.hardware.macs_per_cycle), 0, 0
+            return ceil(macs / self.hardware.macs_per_cycle), 0, 0, 0, 0
 
         if instruction.opcode is Opcode.DMA_STORE:
             tile = buffers[operands["buffer"]]
@@ -266,7 +279,14 @@ class Simulator:
             )
             cycles = ceil(tile.nbytes / self.hardware.dma_bytes_per_cycle)
             buffers.clear()
-            return cycles, 0, tile.nbytes
+            destination_space = MemorySpace(operands["space"])
+            dram_written = (
+                tile.nbytes if destination_space is MemorySpace.DRAM else 0
+            )
+            sram_written = (
+                tile.nbytes if destination_space is MemorySpace.SRAM else 0
+            )
+            return cycles, 0, dram_written, tile.nbytes, sram_written
 
         raise ValueError(f"unsupported opcode: {instruction.opcode}")
 

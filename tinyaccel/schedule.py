@@ -19,6 +19,10 @@ class LoopSpec:
     def __post_init__(self) -> None:
         if self.extent <= 0 or self.tile <= 0:
             raise ValueError("loop extent and tile must be positive")
+        if self.tile > self.extent:
+            raise ValueError(
+                f"loop {self.axis!r} tile {self.tile} exceeds extent {self.extent}"
+            )
         if self.kind not in {"spatial", "reduction"}:
             raise ValueError(f"unsupported loop kind: {self.kind!r}")
 
@@ -41,6 +45,7 @@ class ScheduledOperation:
             raise ValueError(
                 f"operation {self.operation.op!r} has duplicate loop axes"
             )
+        _validate_operation_loops(self.operation, loops)
         object.__setattr__(self, "loops", loops)
 
     def loop(self, axis: str) -> LoopSpec:
@@ -63,8 +68,11 @@ class Schedule:
 
     def __post_init__(self) -> None:
         operations = tuple(self.operations)
-        scheduled_operations = tuple(item.operation for item in operations)
-        if scheduled_operations != self.graph.operations:
+        graph_operations = self.graph.operations
+        if len(operations) != len(graph_operations) or any(
+            scheduled.operation is not operation
+            for scheduled, operation in zip(operations, graph_operations)
+        ):
             raise ValueError(
                 "schedule operations must match graph operations in program order"
             )
@@ -97,6 +105,7 @@ def create_schedule(
     tile_h: int = 8,
     tile_w: int = 8,
     tile_oc: int = 16,
+    tile_ic: int = 16,
 ) -> Schedule:
     """Create the deterministic default schedule for supported operations."""
 
@@ -107,6 +116,7 @@ def create_schedule(
         ("tile_h", tile_h),
         ("tile_w", tile_w),
         ("tile_oc", tile_oc),
+        ("tile_ic", tile_ic),
     ):
         if value <= 0:
             raise ValueError(f"{name} must be positive, got {value}")
@@ -137,7 +147,7 @@ def create_schedule(
                 LoopSpec("oc", output_c, min(tile_oc, output_c)),
                 LoopSpec("kh", kernel_h, kernel_h, "reduction"),
                 LoopSpec("kw", kernel_w, kernel_w, "reduction"),
-                LoopSpec("ic", input_c, input_c, "reduction"),
+                LoopSpec("ic", input_c, min(tile_ic, input_c), "reduction"),
             )
         else:
             raise NotImplementedError(f"cannot schedule operation {operation.op!r}")
@@ -158,3 +168,61 @@ def _elementwise_loops(
             tile = min(tile_m, extent)
         loops.append(LoopSpec(f"d{index}", extent, tile))
     return tuple(loops)
+
+
+def _validate_operation_loops(
+    operation: Operation, loops: tuple[LoopSpec, ...]
+) -> None:
+    expected = _expected_loop_schema(operation)
+    expected_axes = tuple(axis for axis, _, _ in expected)
+    actual_axes = tuple(loop.axis for loop in loops)
+    if actual_axes != expected_axes:
+        raise ValueError(
+            f"{operation.op} schedule axes must be {expected_axes}, got {actual_axes}"
+        )
+
+    for loop, (_, expected_extent, expected_kind) in zip(loops, expected):
+        if loop.extent != expected_extent:
+            raise ValueError(
+                f"{operation.op} loop {loop.axis!r} extent must be "
+                f"{expected_extent}, got {loop.extent}"
+            )
+        if loop.kind != expected_kind:
+            raise ValueError(
+                f"{operation.op} loop {loop.axis!r} kind must be "
+                f"{expected_kind!r}, got {loop.kind!r}"
+            )
+
+
+def _expected_loop_schema(
+    operation: Operation,
+) -> tuple[tuple[str, int, str], ...]:
+    if operation.op == "constant":
+        return ()
+    if operation.op in {"matmul", "matmul_bias_relu"}:
+        lhs, rhs = operation.inputs[:2]
+        m_extent, k_extent = lhs.type.shape
+        n_extent = rhs.type.shape[1]
+        return (
+            ("m", m_extent, "spatial"),
+            ("n", n_extent, "spatial"),
+            ("k", k_extent, "reduction"),
+        )
+    if operation.op in {"add", "relu"}:
+        return tuple(
+            (f"d{index}", extent, "spatial")
+            for index, extent in enumerate(operation.output.type.shape)
+        )
+    if operation.op == "conv2d":
+        n_extent, h_extent, w_extent, oc_extent = operation.output.type.shape
+        kh_extent, kw_extent, ic_extent, _ = operation.inputs[1].type.shape
+        return (
+            ("n", n_extent, "spatial"),
+            ("h", h_extent, "spatial"),
+            ("w", w_extent, "spatial"),
+            ("oc", oc_extent, "spatial"),
+            ("kh", kh_extent, "reduction"),
+            ("kw", kw_extent, "reduction"),
+            ("ic", ic_extent, "reduction"),
+        )
+    raise ValueError(f"cannot validate schedule for operation {operation.op!r}")

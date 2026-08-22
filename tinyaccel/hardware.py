@@ -11,6 +11,7 @@ class HardwareConfig:
     dma_bytes_per_cycle: int = 32
     macs_per_cycle: int = 64
     vector_elements_per_cycle: int = 64
+    overlap_resources: bool = False
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -21,4 +22,9 @@ class HardwareConfig:
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if not isinstance(self.overlap_resources, bool):
+            raise TypeError(
+                "overlap_resources must be a bool, got "
+                f"{type(self.overlap_resources).__name__}"
+            )
 

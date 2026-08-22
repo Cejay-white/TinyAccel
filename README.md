@@ -27,6 +27,7 @@ python -m examples.schedule_memory
 python -m examples.conv2d
 python -m examples.layout_transform
 python -m examples.im2col
+python -m examples.resource_overlap
 ```
 
 The core API is small:
@@ -74,18 +75,25 @@ DMA_LOAD   instructions=60   cycles=840
 MATMUL     instructions=30   cycles=720
 DMA_STORE  instructions=6    cycles=144
 ----------------------------
+Execution mode:     sequential
 Total cycles:       1722
+Sequential cycles:  1722
+Overlap saved:      0
 Layout cycles:      0
 DRAM bytes read:    26880
 DRAM bytes written: 4608
 SRAM bytes read:    4608
 SRAM bytes written: 26880
 Peak SRAM bytes:    2048
+DMA     busy:      984      utilization=57.1%
+COMPUTE busy:      738      utilization=42.9%
+LAYOUT  busy:      0        utilization=0.0%
 ```
 
-The simulator currently models instructions sequentially. Cycle counts are an
-analytical estimate based on configurable DMA bandwidth, MAC throughput, and
-vector layout throughput, not a cycle-accurate hardware model.
+The simulator defaults to sequential timing for compatibility and can also
+schedule independent DMA, compute, and layout work concurrently. Cycle counts
+are an analytical estimate based on configurable DMA bandwidth, MAC throughput,
+and vector layout throughput, not a cycle-accurate hardware model.
 
 `compiled.timeline()` renders the measured instruction events as a compact
 ASCII Gantt chart. Large programs retain their first and last events while the
@@ -94,13 +102,13 @@ middle is folded:
 ```text
 TinyAccel Instruction Timeline
 cycles 0                                      1722
-0000 ZERO      [     0,4     ) |#                                               |
-0001 DMA_LOAD  [     4,20    ) |#                                               |
-0002 DMA_LOAD  [    20,36    ) |##                                              |
+0000 COMPUTE ZERO      [     0,4     ) |#                                               |
+0001 DMA     DMA_LOAD  [     4,20    ) |#                                               |
+0002 DMA     DMA_LOAD  [    20,36    ) |##                                              |
      ... 96 instructions omitted ...
-0099 DMA_LOAD  [  1682,1690  ) |                                              ##|
-0100 MATMUL    [  1690,1706  ) |                                               #|
-0101 DMA_STORE [  1706,1722  ) |                                               #|
+0099 DMA     DMA_LOAD  [  1682,1690  ) |                                              ##|
+0100 COMPUTE MATMUL    [  1690,1706  ) |                                               #|
+0101 DMA     DMA_STORE [  1706,1722  ) |                                               #|
 ```
 
 ## What the current prototype contains
@@ -131,7 +139,8 @@ cycles 0                                      1722
   `RELU`, `TRANSPOSE`, `CONV2D`, and `DMA_STORE` instructions
 - Functional accelerator simulation checked against NumPy
 - Cycle, DRAM/SRAM transfer traffic, and peak SRAM reporting
-- Per-instruction cycle events and an ASCII execution timeline
+- Resource-tagged instruction events and an overlapping ASCII execution timeline
+- Optional DMA/compute/layout resource-conflict and dependency simulation
 - Hardware configuration and compile-time SRAM capacity checking
 
 ## Optimization pipeline
@@ -278,6 +287,33 @@ beside total cycles and peak SRAM. Run the side-by-side comparison with:
 python -m examples.im2col
 ```
 
+## Resource-aware timing
+
+Sequential timing remains the default, so existing cycle comparisons do not
+change. Enable independent DMA, compute, and layout lanes in the analytical
+scheduler with:
+
+```python
+hardware = tinyaccel.HardwareConfig(overlap_resources=True)
+compiled = tinyaccel.compile(graph, hardware=hardware)
+```
+
+The scheduler preserves RAW, WAR, and WAW dependencies for local buffers and
+persistent values while serializing instructions that use the same hardware
+resource. Work without a dependency may overlap on different resources. The
+functional simulator still executes deterministically in program order; only
+the analytical start/end cycles are scheduled concurrently.
+
+`SimulationReport.sequential_cycles` reports the total instruction work,
+`total_cycles` reports elapsed time, and `overlap_cycles_saved` exposes the
+difference. `resource_cycles` and `resource_utilization` break down activity for
+the `DMA`, `COMPUTE`, and `LAYOUT` lanes. Timeline rows include their assigned
+resource, so overlapping intervals and resource stalls remain visible:
+
+```bash
+python -m examples.resource_overlap
+```
+
 ## Run tests
 
 ```bash
@@ -289,9 +325,10 @@ python -m unittest discover -v
 - **v0.2:** multi-operator IR, foundational passes, fusion, and visualization
 - **v0.3:** explicit schedules, lifetime analysis, and memory
   planning
-- **v0.4 (current):** NCHW/NHWC Conv2D, layout cost modeling, automatic
+- **v0.4:** NCHW/NHWC Conv2D, layout cost modeling, automatic
   canonicalization, and direct/im2col lowering comparison
-- **v0.5:** richer ISA, timelines, and resource-conflict simulation
+- **v0.5 (current):** resource-tagged timelines, dependency hazards, and
+  optional DMA/compute/layout overlap simulation
 - **v0.6:** PyTorch FX frontend and additional backends
 
 TinyAccel is an educational and experimental project. It aims to make the

@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from enum import Enum
 from math import ceil
-from typing import Mapping
+from typing import Iterable, Mapping
 
 import numpy as np
 
 from .hardware import HardwareConfig
 from .isa import Instruction, MemorySpace, Opcode, Program
+
+
+class ExecutionResource(str, Enum):
+    """Independent hardware resources represented by the timing model."""
+
+    DMA = "DMA"
+    COMPUTE = "COMPUTE"
+    LAYOUT = "LAYOUT"
 
 
 @dataclass(frozen=True)
@@ -19,6 +28,7 @@ class TimelineEvent:
     opcode: str
     start_cycle: int
     end_cycle: int
+    resource: str = ExecutionResource.COMPUTE.value
 
     @property
     def cycles(self) -> int:
@@ -36,6 +46,40 @@ class SimulationReport:
     timeline: tuple[TimelineEvent, ...]
     sram_bytes_read: int = 0
     sram_bytes_written: int = 0
+    overlap_resources: bool = False
+
+    @property
+    def sequential_cycles(self) -> int:
+        """Cycles required when every instruction runs serially."""
+
+        return sum(self.cycles_by_opcode.values())
+
+    @property
+    def overlap_cycles_saved(self) -> int:
+        """Elapsed cycles hidden by independent resource execution."""
+
+        return max(0, self.sequential_cycles - self.total_cycles)
+
+    @property
+    def resource_cycles(self) -> Mapping[str, int]:
+        """Busy cycles accumulated by each modeled hardware resource."""
+
+        result = {resource.value: 0 for resource in ExecutionResource}
+        for opcode_name, cycles in self.cycles_by_opcode.items():
+            resource = _resource_for_opcode(Opcode(opcode_name))
+            result[resource.value] += cycles
+        return result
+
+    @property
+    def resource_utilization(self) -> Mapping[str, float]:
+        """Fraction of elapsed time for which each resource is busy."""
+
+        if self.total_cycles == 0:
+            return {resource.value: 0.0 for resource in ExecutionResource}
+        return {
+            resource: cycles / self.total_cycles
+            for resource, cycles in self.resource_cycles.items()
+        }
 
     @property
     def layout_cycles(self) -> int:
@@ -57,7 +101,11 @@ class SimulationReport:
         lines.extend(
             (
                 "-" * 28,
+                "Execution mode:     "
+                + ("resource overlap" if self.overlap_resources else "sequential"),
                 f"Total cycles:       {self.total_cycles}",
+                f"Sequential cycles:  {self.sequential_cycles}",
+                f"Overlap saved:      {self.overlap_cycles_saved}",
                 f"Layout cycles:      {self.layout_cycles}",
                 f"DRAM bytes read:    {self.dram_bytes_read}",
                 f"DRAM bytes written: {self.dram_bytes_written}",
@@ -66,10 +114,15 @@ class SimulationReport:
                 f"Peak SRAM bytes:    {self.peak_sram_bytes}",
             )
         )
+        for resource, cycles in self.resource_cycles.items():
+            utilization = self.resource_utilization[resource]
+            lines.append(
+                f"{resource:<7} busy:      {cycles:<8} utilization={utilization:.1%}"
+            )
         return "\n".join(lines)
 
     def format_timeline(self, *, width: int = 48, max_events: int = 24) -> str:
-        """Render a compact Gantt-style view of sequential instruction costs."""
+        """Render a compact Gantt-style view of instruction resource events."""
 
         if width < 10:
             raise ValueError("timeline width must be at least 10")
@@ -100,14 +153,15 @@ class SimulationReport:
             )
             bar = " " * start + "#" * (end - start) + " " * (width - end)
             lines.append(
-                f"{event.instruction_index:04d} {event.opcode:<9} "
+                f"{event.instruction_index:04d} {event.resource:<7} "
+                f"{event.opcode:<9} "
                 f"[{event.start_cycle:>6},{event.end_cycle:<6}) |{bar}|"
             )
         return "\n".join(lines)
 
 
 class Simulator:
-    """Execute ISA instructions and account for sequential resource costs."""
+    """Execute ISA instructions and account for resource-aware timing costs."""
 
     def __init__(self, hardware: HardwareConfig) -> None:
         self.hardware = hardware
@@ -157,24 +211,15 @@ class Simulator:
                 f"memory plan uses {peak_sram_bytes} SRAM bytes, exceeding "
                 f"the {self.hardware.sram_bytes}-byte capacity"
             )
-        current_cycle = 0
-        timeline: list[TimelineEvent] = []
+        instruction_cycles: list[int] = []
 
-        for index, instruction in enumerate(program.instructions):
+        for instruction in program.instructions:
             instruction_counts[instruction.opcode.value] += 1
             cycles, dram_read, dram_written, sram_read, sram_written = self._execute(
                 instruction, memory, buffers
             )
             cycles_by_opcode[instruction.opcode.value] += cycles
-            timeline.append(
-                TimelineEvent(
-                    index,
-                    instruction.opcode.value,
-                    current_cycle,
-                    current_cycle + cycles,
-                )
-            )
-            current_cycle += cycles
+            instruction_cycles.append(cycles)
             dram_bytes_read += dram_read
             dram_bytes_written += dram_written
             sram_bytes_read += sram_read
@@ -189,8 +234,13 @@ class Simulator:
                     f"the {self.hardware.sram_bytes}-byte capacity"
                 )
 
+        timeline = _schedule_timeline(
+            program.instructions,
+            instruction_cycles,
+            overlap_resources=self.hardware.overlap_resources,
+        )
         report = SimulationReport(
-            total_cycles=sum(cycles_by_opcode.values()),
+            total_cycles=max((event.end_cycle for event in timeline), default=0),
             instruction_counts=dict(instruction_counts),
             cycles_by_opcode=dict(cycles_by_opcode),
             dram_bytes_read=dram_bytes_read,
@@ -199,6 +249,7 @@ class Simulator:
             timeline=tuple(timeline),
             sram_bytes_read=sram_bytes_read,
             sram_bytes_written=sram_bytes_written,
+            overlap_resources=self.hardware.overlap_resources,
         )
         return memory[program.output_name], report
 
@@ -353,6 +404,153 @@ class Simulator:
                 )
             validated[name] = value
         return validated
+
+
+def _resource_for_opcode(opcode: Opcode) -> ExecutionResource:
+    if opcode in {Opcode.DMA_LOAD, Opcode.DMA_STORE}:
+        return ExecutionResource.DMA
+    if opcode in {Opcode.IM2COL, Opcode.RESHAPE, Opcode.TRANSPOSE}:
+        return ExecutionResource.LAYOUT
+    return ExecutionResource.COMPUTE
+
+
+def _instruction_accesses(
+    instruction: Instruction,
+) -> tuple[set[str], set[str]]:
+    """Return local/persistent storage reads and writes for dependency timing."""
+
+    operands = instruction.operands
+
+    def buffer(name: str) -> str:
+        return f"buffer:{name}"
+
+    def memory(name: str) -> str:
+        return f"memory:{name}"
+
+    local_epoch = "buffer:*"
+
+    if instruction.opcode is Opcode.ZERO:
+        return {local_epoch}, {buffer(operands["buffer"])}
+    if instruction.opcode is Opcode.DMA_LOAD:
+        return {
+            local_epoch,
+            memory(operands["source"]),
+        }, {buffer(operands["buffer"])}
+    if instruction.opcode in {Opcode.IM2COL, Opcode.RESHAPE, Opcode.TRANSPOSE}:
+        return (
+            {local_epoch, buffer(operands["input"])},
+            {buffer(operands["output"])},
+        )
+    if instruction.opcode is Opcode.MATMUL:
+        accumulator = buffer(operands["accumulator"])
+        return {
+            buffer(operands["lhs"]),
+            buffer(operands["rhs"]),
+            accumulator,
+            local_epoch,
+        }, {accumulator}
+    if instruction.opcode is Opcode.ADD:
+        return {
+            buffer(operands["lhs"]),
+            buffer(operands["rhs"]),
+            local_epoch,
+        }, {buffer(operands["output"])}
+    if instruction.opcode is Opcode.RELU:
+        return (
+            {local_epoch, buffer(operands["input"])},
+            {buffer(operands["output"])},
+        )
+    if instruction.opcode is Opcode.CONV2D:
+        accumulator = buffer(operands["accumulator"])
+        return {
+            buffer(operands["input"]),
+            buffer(operands["weight"]),
+            accumulator,
+            local_epoch,
+        }, {accumulator}
+    if instruction.opcode is Opcode.DMA_STORE:
+        return {buffer(operands["buffer"])}, {
+            local_epoch,
+            memory(operands["output"]),
+        }
+    raise ValueError(f"unsupported opcode: {instruction.opcode}")
+
+
+def _schedule_timeline(
+    instructions: Iterable[Instruction],
+    durations: Iterable[int],
+    *,
+    overlap_resources: bool,
+) -> tuple[TimelineEvent, ...]:
+    """Schedule instructions in order while honoring storage and unit hazards."""
+
+    instruction_list = tuple(instructions)
+    duration_list = tuple(durations)
+    if len(instruction_list) != len(duration_list):
+        raise ValueError("instruction and duration counts must match")
+
+    if not overlap_resources:
+        current_cycle = 0
+        events: list[TimelineEvent] = []
+        for index, (instruction, duration) in enumerate(
+            zip(instruction_list, duration_list, strict=True)
+        ):
+            resource = _resource_for_opcode(instruction.opcode)
+            events.append(
+                TimelineEvent(
+                    index,
+                    instruction.opcode.value,
+                    current_cycle,
+                    current_cycle + duration,
+                    resource.value,
+                )
+            )
+            current_cycle += duration
+        return tuple(events)
+
+    resource_available = {resource: 0 for resource in ExecutionResource}
+    last_writer: dict[str, int] = {}
+    last_readers: defaultdict[str, set[int]] = defaultdict(set)
+    events = []
+
+    for index, (instruction, duration) in enumerate(
+        zip(instruction_list, duration_list, strict=True)
+    ):
+        reads, writes = _instruction_accesses(instruction)
+        dependencies: set[int] = set()
+        for storage in reads:
+            writer = last_writer.get(storage)
+            if writer is not None:
+                dependencies.add(writer)
+        for storage in writes:
+            writer = last_writer.get(storage)
+            if writer is not None:
+                dependencies.add(writer)
+            dependencies.update(last_readers[storage])
+
+        dependency_cycle = max(
+            (events[dependency].end_cycle for dependency in dependencies),
+            default=0,
+        )
+        resource = _resource_for_opcode(instruction.opcode)
+        start_cycle = max(dependency_cycle, resource_available[resource])
+        event = TimelineEvent(
+            index,
+            instruction.opcode.value,
+            start_cycle,
+            start_cycle + duration,
+            resource.value,
+        )
+        events.append(event)
+        resource_available[resource] = event.end_cycle
+
+        for storage in reads - writes:
+            last_readers[storage].add(index)
+        for storage in writes:
+            last_writer[storage] = index
+            last_readers[storage].clear()
+
+    return tuple(events)
 
 
 def _read_tile(

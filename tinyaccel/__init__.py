@@ -23,7 +23,7 @@ from .passes import (
     PassResult,
     default_pipeline,
 )
-from .simulator import SimulationReport, TimelineEvent
+from .simulator import ExecutionResource, SimulationReport, TimelineEvent
 from .schedule import LoopSpec, Schedule, ScheduledOperation, create_schedule
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "ConstantFoldingPass",
     "DeadCodeEliminationPass",
     "Executable",
+    "ExecutionResource",
     "Graph",
     "GraphBuilder",
     "HardwareConfig",

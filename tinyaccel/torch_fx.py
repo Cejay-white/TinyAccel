@@ -36,6 +36,7 @@ def from_torch_fx(
     builder = GraphBuilder()
     values: dict[int, Value] = {}
     graph_outputs: tuple[Value, ...] | None = None
+    inferred_layouts = _infer_placeholder_layouts(graph_module, nodes)
 
     for node in nodes:
         node_op = str(getattr(node, "op", ""))
@@ -52,6 +53,12 @@ def from_torch_fx(
                     f"missing input spec for FX placeholder {spec_key!r}"
                 )
             tensor_type = _normalize_input_spec(spec, spec_key)
+            if tensor_type.layout is None and id(node) in inferred_layouts:
+                tensor_type = TensorType(
+                    tensor_type.shape,
+                    tensor_type.dtype,
+                    inferred_layouts[id(node)],
+                )
             values[id(node)] = builder.input(
                 node_name,
                 tensor_type.shape,
@@ -88,17 +95,28 @@ def from_torch_fx(
             )
             continue
 
+        if node_op == "call_module":
+            if not isinstance(target, str):
+                raise TypeError(
+                    f"call_module target must be a string, got {target!r}"
+                )
+            values[id(node)] = _lower_module(
+                builder,
+                values,
+                _fetch_attr(graph_module, target),
+                target,
+                args,
+                kwargs,
+                node_name,
+            )
+            continue
+
         if node_op == "output":
             if len(args) != 1 or kwargs:
                 raise ValueError("FX output must contain exactly one positional value")
             graph_outputs = _resolve_outputs(args[0], values)
             continue
 
-        if node_op == "call_module":
-            raise NotImplementedError(
-                f"FX call_module target {target!r} is not supported; "
-                "trace primitive MatMul/Add/ReLU calls instead"
-            )
         raise NotImplementedError(f"unsupported FX node op {node_op!r}")
 
     if graph_outputs is None:
@@ -189,6 +207,105 @@ def _lower_call(
     raise NotImplementedError(f"unsupported FX operation {operation!r}")
 
 
+def _lower_module(
+    builder: GraphBuilder,
+    values: Mapping[int, Value],
+    module: Any,
+    target: str,
+    args: tuple[Any, ...],
+    kwargs: Mapping[str, Any],
+    output_name: str,
+) -> Value:
+    kind = _module_kind(module)
+    if kind is None:
+        raise NotImplementedError(
+            f"unsupported FX call_module target {target!r} "
+            f"({_qualified_type_name(module)})"
+        )
+    if len(args) != 1 or kwargs:
+        raise ValueError(
+            f"FX {kind} module requires one positional tensor and no keywords"
+        )
+    input_value = _resolve_value(args[0], values)
+
+    if kind == "Linear":
+        weight = _as_numpy(_require_attr(module, "weight", target), f"{target}.weight")
+        if weight.ndim != 2:
+            raise ValueError(
+                f"FX Linear weight must be rank 2, got shape {weight.shape}"
+            )
+        transposed_weight = builder.constant(
+            weight.T.copy(),
+            name=f"{output_name}_weight",
+        )
+        bias = getattr(module, "bias", None)
+        product_name = output_name if bias is None else f"{output_name}_matmul"
+        result = builder.matmul(input_value, transposed_weight, name=product_name)
+        if bias is None:
+            return result
+        bias_value = _as_numpy(bias, f"{target}.bias")
+        if bias_value.ndim != 1 or bias_value.shape[0] != weight.shape[0]:
+            raise ValueError(
+                "FX Linear bias must be rank 1 with one value per output feature"
+            )
+        bias_constant = builder.constant(
+            bias_value,
+            name=f"{output_name}_bias",
+        )
+        return builder.add(result, bias_constant, name=output_name)
+
+    if kind == "Conv2d":
+        groups = getattr(module, "groups", 1)
+        if groups != 1:
+            raise NotImplementedError("FX Conv2d currently requires groups=1")
+        padding_mode = str(getattr(module, "padding_mode", "zeros"))
+        if padding_mode != "zeros":
+            raise NotImplementedError(
+                "FX Conv2d currently requires padding_mode='zeros'"
+            )
+        padding = getattr(module, "padding", (0, 0))
+        if isinstance(padding, str):
+            raise NotImplementedError(
+                "FX Conv2d string padding modes are unsupported"
+            )
+        weight = _as_numpy(_require_attr(module, "weight", target), f"{target}.weight")
+        if weight.ndim != 4:
+            raise ValueError(
+                f"FX Conv2d weight must be rank 4, got shape {weight.shape}"
+            )
+        weight_constant = builder.constant(
+            weight,
+            name=f"{output_name}_weight",
+            layout="OIHW",
+        )
+        bias = getattr(module, "bias", None)
+        convolution_name = output_name if bias is None else f"{output_name}_conv"
+        result = builder.conv2d(
+            input_value,
+            weight_constant,
+            stride=getattr(module, "stride", (1, 1)),
+            padding=padding,
+            dilation=getattr(module, "dilation", (1, 1)),
+            name=convolution_name,
+        )
+        if bias is None:
+            return result
+        bias_value = _as_numpy(bias, f"{target}.bias")
+        if bias_value.ndim != 1 or bias_value.shape[0] != weight.shape[0]:
+            raise ValueError(
+                "FX Conv2d bias must be rank 1 with one value per output channel"
+            )
+        bias_constant = builder.constant(
+            bias_value.reshape(1, -1, 1, 1),
+            name=f"{output_name}_bias",
+        )
+        return builder.add(result, bias_constant, name=output_name)
+
+    if getattr(module, "inplace", False):
+        raise NotImplementedError("in-place FX ReLU module is unsupported")
+    return builder.relu(input_value, name=output_name)
+
+
 def _resolve_binary_operands(
     builder: GraphBuilder,
     values: Mapping[int, Value],
@@ -260,6 +377,80 @@ def _classify_method_target(target: Any) -> str:
     if name == "relu":
         return "relu"
     raise NotImplementedError(f"unsupported FX call_method target {name!r}")
+
+
+def _module_kind(module: Any) -> str | None:
+    name = type(module).__name__
+    if name in {"Linear", "Conv2d", "ReLU"}:
+        return name
+    return None
+
+
+def _infer_placeholder_layouts(
+    graph_module: Any,
+    nodes: tuple[Any, ...],
+) -> dict[int, str]:
+    """Infer PyTorch's logical NCHW layout for Conv2d input placeholders."""
+
+    layouts: dict[int, str] = {}
+
+    def visit_input(node: Any) -> None:
+        node_op = str(getattr(node, "op", ""))
+        if node_op == "placeholder":
+            layouts[id(node)] = "NCHW"
+            return
+        args = tuple(getattr(node, "args", ()))
+        if not args:
+            return
+        if node_op == "call_module":
+            target = getattr(node, "target", None)
+            if not isinstance(target, str):
+                return
+            kind = _module_kind(_fetch_attr(graph_module, target))
+            if kind in {"Conv2d", "ReLU"}:
+                visit_input(args[0])
+            return
+        if node_op == "call_function":
+            try:
+                operation = _classify_function_target(getattr(node, "target", None))
+            except NotImplementedError:
+                return
+            if operation == "relu":
+                visit_input(args[0])
+            return
+        if node_op == "call_method":
+            try:
+                operation = _classify_method_target(getattr(node, "target", None))
+            except NotImplementedError:
+                return
+            if operation == "relu":
+                visit_input(args[0])
+
+    for node in nodes:
+        if str(getattr(node, "op", "")) != "call_module":
+            continue
+        target = getattr(node, "target", None)
+        if not isinstance(target, str):
+            continue
+        if _module_kind(_fetch_attr(graph_module, target)) != "Conv2d":
+            continue
+        args = tuple(getattr(node, "args", ()))
+        if args:
+            visit_input(args[0])
+    return layouts
+
+
+def _require_attr(value: Any, name: str, target: str) -> Any:
+    if not hasattr(value, name):
+        raise AttributeError(
+            f"FX module target {target!r} has no attribute {name!r}"
+        )
+    return getattr(value, name)
+
+
+def _qualified_type_name(value: Any) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
 
 
 def _normalize_input_spec(spec: Any, name: str) -> TensorType:

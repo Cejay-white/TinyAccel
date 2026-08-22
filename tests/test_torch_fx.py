@@ -1,4 +1,5 @@
 import operator
+import importlib.util
 import sys
 import unittest
 from dataclasses import dataclass, field
@@ -32,6 +33,42 @@ class FakeGraphModule:
         self.graph = SimpleNamespace(nodes=tuple(nodes))
         for name, value in attributes.items():
             setattr(self, name, value)
+
+
+class Linear:
+    def __init__(self, weight, bias=None):
+        self.weight = weight
+        self.bias = bias
+
+
+class Conv2d:
+    def __init__(
+        self,
+        weight,
+        bias=None,
+        *,
+        stride=(1, 1),
+        padding=(0, 0),
+        dilation=(1, 1),
+        groups=1,
+        padding_mode="zeros",
+    ):
+        self.weight = weight
+        self.bias = bias
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.padding_mode = padding_mode
+
+
+class ReLU:
+    def __init__(self, inplace=False):
+        self.inplace = inplace
+
+
+class Sigmoid:
+    pass
 
 
 def build_function_graph():
@@ -130,19 +167,99 @@ class TorchFxFrontendTests(unittest.TestCase):
         self.assertEqual(graph.operations[0].output.type.layout, "HWIO")
         self.assertEqual(graph.outputs, (graph.inputs[0], graph.operations[0].output))
 
+    def test_imports_linear_and_relu_modules(self) -> None:
+        value = FakeFxNode("placeholder", "value", "value")
+        linear = FakeFxNode("call_module", "linear", "linear", (value,))
+        result = FakeFxNode("call_module", "activation", "result", (linear,))
+        output = FakeFxNode("output", "output", "output", (result,))
+        weight = np.arange(20, dtype=np.float32).reshape(4, 5) / 10
+        bias = np.linspace(-0.5, 0.5, 4, dtype=np.float32)
+        graph = tinyaccel.from_torch_fx(
+            FakeGraphModule(
+                (value, linear, result, output),
+                linear=Linear(weight, bias),
+                activation=ReLU(),
+            ),
+            {"value": (3, 5)},
+        )
+
+        self.assertEqual(
+            [operation.op for operation in graph.operations],
+            ["constant", "matmul", "constant", "add", "relu"],
+        )
+        np.testing.assert_array_equal(
+            graph.operations[0].attributes["value"], weight.T
+        )
+        rng = np.random.default_rng(83)
+        value_data = rng.standard_normal((3, 5), dtype=np.float32)
+        actual = tinyaccel.compile(graph).run(value_data)
+        expected = np.maximum(value_data @ weight.T + bias, 0)
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+    def test_imports_conv2d_module_with_inferred_nchw_layout(self) -> None:
+        image = FakeFxNode("placeholder", "image", "image")
+        convolution = FakeFxNode(
+            "call_module", "features.convolution", "convolution", (image,)
+        )
+        result = FakeFxNode(
+            "call_module", "features.activation", "result", (convolution,)
+        )
+        output = FakeFxNode("output", "output", "output", (result,))
+        rng = np.random.default_rng(89)
+        weight = rng.standard_normal((3, 2, 3, 2), dtype=np.float32)
+        bias = rng.standard_normal(3, dtype=np.float32)
+        graph = tinyaccel.from_torch_fx(
+            FakeGraphModule(
+                (image, convolution, result, output),
+                features=SimpleNamespace(
+                    convolution=Conv2d(
+                        weight,
+                        bias,
+                        stride=(2, 1),
+                        padding=(1, 0),
+                    ),
+                    activation=ReLU(),
+                ),
+            ),
+            {"image": (1, 2, 5, 6)},
+        )
+
+        self.assertEqual(graph.inputs[0].type.layout, "NCHW")
+        self.assertEqual(graph.operations[0].output.type.layout, "OIHW")
+        self.assertEqual(
+            [operation.op for operation in graph.operations],
+            ["constant", "conv2d", "constant", "add", "relu"],
+        )
+        image_data = rng.standard_normal((1, 2, 5, 6), dtype=np.float32)
+        actual = tinyaccel.compile(graph).run(image_data)
+        expected_nhwc = tinyaccel.conv2d_nhwc(
+            image_data.transpose(0, 2, 3, 1),
+            weight.transpose(2, 3, 1, 0),
+            stride=(2, 1),
+            padding=(1, 1, 0, 0),
+        )
+        expected = np.maximum(
+            expected_nhwc.transpose(0, 3, 1, 2)
+            + bias.reshape(1, -1, 1, 1),
+            0,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
     def test_rejects_missing_specs_and_unsupported_nodes(self) -> None:
         value = FakeFxNode("placeholder", "value", "value")
         output = FakeFxNode("output", "output", "output", (value,))
         with self.assertRaisesRegex(ValueError, "missing input spec"):
             tinyaccel.from_torch_fx(FakeGraphModule((value, output)), {})
 
-        call_module = FakeFxNode("call_module", "relu", "relu", (value,))
+        call_module = FakeFxNode("call_module", "sigmoid", "sigmoid", (value,))
         module_output = FakeFxNode(
             "output", "output", "output", (call_module,)
         )
         with self.assertRaisesRegex(NotImplementedError, "call_module"):
             tinyaccel.from_torch_fx(
-                FakeGraphModule((value, call_module, module_output)),
+                FakeGraphModule(
+                    (value, call_module, module_output), sigmoid=Sigmoid()
+                ),
                 {"value": (2, 3)},
             )
 
@@ -178,6 +295,84 @@ class TorchFxFrontendTests(unittest.TestCase):
                 FakeGraphModule((lhs, inplace, inplace_output)),
                 {"lhs": (2, 3)},
             )
+
+        module_relu = FakeFxNode(
+            "call_module", "activation", "module_relu", (lhs,)
+        )
+        module_output = FakeFxNode(
+            "output", "output", "output", (module_relu,)
+        )
+        with self.assertRaisesRegex(NotImplementedError, "in-place"):
+            tinyaccel.from_torch_fx(
+                FakeGraphModule(
+                    (lhs, module_relu, module_output),
+                    activation=ReLU(inplace=True),
+                ),
+                {"lhs": (2, 3)},
+            )
+
+    def test_rejects_unsupported_conv2d_configuration(self) -> None:
+        image = FakeFxNode("placeholder", "image", "image")
+        convolution = FakeFxNode(
+            "call_module", "convolution", "convolution", (image,)
+        )
+        output = FakeFxNode("output", "output", "output", (convolution,))
+        module = FakeGraphModule(
+            (image, convolution, output),
+            convolution=Conv2d(
+                np.ones((4, 2, 3, 3), dtype=np.float32),
+                groups=2,
+            ),
+        )
+        with self.assertRaisesRegex(NotImplementedError, "groups=1"):
+            tinyaccel.from_torch_fx(module, {"image": (1, 4, 5, 5)})
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch") is not None,
+        "PyTorch optional dependency is not installed",
+    )
+    def test_traces_real_linear_and_conv2d_modules(self) -> None:
+        import torch
+
+        torch.manual_seed(97)
+        linear = torch.nn.Sequential(
+            torch.nn.Linear(5, 4),
+            torch.nn.ReLU(),
+        ).eval()
+        linear_input = torch.randn(3, 5)
+        linear_graph = tinyaccel.trace_torch_module(linear, linear_input)
+        linear_actual = tinyaccel.compile(linear_graph).run(
+            linear_input.detach().cpu().numpy()
+        )
+        np.testing.assert_allclose(
+            linear_actual,
+            linear(linear_input).detach().cpu().numpy(),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+        convolution = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                2,
+                3,
+                (3, 2),
+                stride=(2, 1),
+                padding=(1, 0),
+            ),
+            torch.nn.ReLU(),
+        ).eval()
+        image = torch.randn(1, 2, 5, 6)
+        convolution_graph = tinyaccel.trace_torch_module(convolution, image)
+        self.assertEqual(convolution_graph.inputs[0].type.layout, "NCHW")
+        convolution_actual = tinyaccel.compile(convolution_graph).run(
+            image.detach().cpu().numpy()
+        )
+        np.testing.assert_allclose(
+            convolution_actual,
+            convolution(image).detach().cpu().numpy(),
+            rtol=1e-5,
+            atol=1e-5,
+        )
 
     def test_trace_entrypoint_reports_missing_optional_dependency(self) -> None:
         with mock.patch.dict(sys.modules, {"torch": None}):

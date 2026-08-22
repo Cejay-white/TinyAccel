@@ -145,7 +145,8 @@ cycles 0                                      1722
 - Resource-tagged instruction events and an overlapping ASCII execution timeline
 - Optional DMA/compute/layout resource-conflict and dependency simulation
 - Optional ping/pong buffering and reduction-tile DMA prefetch
-- Optional PyTorch FX import for placeholders, parameters, MatMul, Add, and ReLU
+- Optional PyTorch FX import for primitive operations and standard
+  `nn.Linear`/`nn.Conv2d`/`nn.ReLU` modules
 - Hardware configuration and compile-time SRAM capacity checking
 
 ## Optimization pipeline
@@ -368,11 +369,11 @@ import tinyaccel
 class TinyMlp(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.randn(5, 4))
-        self.bias = torch.nn.Parameter(torch.randn(4))
+        self.linear = torch.nn.Linear(5, 4)
+        self.activation = torch.nn.ReLU()
 
     def forward(self, value):
-        return torch.relu(value @ self.weight + self.bias)
+        return self.activation(self.linear(value))
 
 example = torch.randn(3, 5)
 graph = tinyaccel.trace_torch_module(TinyMlp().eval(), example)
@@ -381,11 +382,18 @@ compiled = tinyaccel.compile(graph)
 
 The importer follows the
 [public FX node protocol](https://docs.pytorch.org/docs/stable/fx.html) and
-currently supports `placeholder`, nested `get_attr`,
-`call_function`/`call_method` MatMul, Add and ReLU, plus flat single or multiple
-outputs. Scalar Add literals are converted to constants. In-place ReLU, scaled
-Add (`alpha != 1`), and `call_module` nodes are rejected explicitly instead of
-being guessed. Advanced users can pass an existing FX `GraphModule` to
+supports `placeholder`, nested `get_attr`, `call_function`/`call_method`
+MatMul, Add and ReLU, and `call_module` Linear, Conv2d and ReLU, plus flat
+single or multiple outputs. Linear weights are transposed from PyTorch's
+`[out_features, in_features]` form. Conv2d inputs automatically receive NCHW
+layout, weights retain OIHW layout, and channel bias is reshaped for NCHW
+broadcasting. Scalar Add literals are converted to constants.
+
+Linear currently requires a rank-2 input. Conv2d supports ordinary
+`groups=1`, zero-padded modules with integer/tuple padding, stride and dilation;
+grouped/depthwise convolution, non-zero padding modes and string padding are
+rejected explicitly. In-place ReLU and scaled Add (`alpha != 1`) are also
+unsupported. Advanced users can pass an existing FX `GraphModule` to
 `from_torch_fx` with explicit input specs and optional activation/parameter
 layouts.
 
@@ -408,9 +416,11 @@ python -m unittest discover -v
   canonicalization, and direct/im2col lowering comparison
 - **v0.5:** resource-tagged timelines, dependency hazards,
   DMA/compute/layout overlap, and reduction-tile ping/pong prefetch
-- **v0.6 (current):** optional PyTorch FX import for primitive MatMul/Add/ReLU
+- **v0.6:** optional PyTorch FX import for primitive MatMul/Add/ReLU
   graphs and parameter capture
-- **v0.7:** FX Linear/Conv2d module lowering and additional backends
+- **v0.7 (current):** FX Linear/Conv2d/ReLU module lowering with automatic
+  PyTorch weight and layout conversion
+- **v0.8:** grouped convolution, pooling, flattening, and additional backends
 
 TinyAccel is an educational and experimental project. It aims to make the
 compiler-to-hardware path concrete, not to replace production compiler stacks.

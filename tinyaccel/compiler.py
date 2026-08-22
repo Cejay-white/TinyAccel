@@ -32,6 +32,7 @@ class CompileOptions:
     optimize: bool = True
     tile_ic: int = 16
     conv2d_lowering: str = "direct"
+    double_buffer: bool = False
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -49,6 +50,11 @@ class CompileOptions:
             raise ValueError(
                 "conv2d_lowering must be 'direct' or 'im2col', got "
                 f"{self.conv2d_lowering!r}"
+            )
+        if not isinstance(self.double_buffer, bool):
+            raise TypeError(
+                "double_buffer must be a bool, got "
+                f"{type(self.double_buffer).__name__}"
             )
 
 
@@ -145,7 +151,13 @@ def compile(
                 operation.attributes["value"], dtype=operation.output.type.dtype
             ).copy()
         elif operation.op == "matmul":
-            _lower_matmul(scheduled, instructions, hardware, memory_plan.total_bytes)
+            _lower_matmul(
+                scheduled,
+                instructions,
+                hardware,
+                memory_plan.total_bytes,
+                options.double_buffer,
+            )
         elif operation.op == "add":
             _lower_add(scheduled, instructions, hardware, memory_plan.total_bytes)
         elif operation.op == "relu":
@@ -156,16 +168,28 @@ def compile(
             )
         elif operation.op == "matmul_bias_relu":
             _lower_matmul_bias_relu(
-                scheduled, instructions, hardware, memory_plan.total_bytes
+                scheduled,
+                instructions,
+                hardware,
+                memory_plan.total_bytes,
+                options.double_buffer,
             )
         elif operation.op == "conv2d":
             if options.conv2d_lowering == "direct":
                 _lower_conv2d(
-                    scheduled, instructions, hardware, memory_plan.total_bytes
+                    scheduled,
+                    instructions,
+                    hardware,
+                    memory_plan.total_bytes,
+                    options.double_buffer,
                 )
             else:
                 _lower_conv2d_im2col(
-                    scheduled, instructions, hardware, memory_plan.total_bytes
+                    scheduled,
+                    instructions,
+                    hardware,
+                    memory_plan.total_bytes,
+                    options.double_buffer,
                 )
         else:
             raise NotImplementedError(
@@ -209,6 +233,7 @@ def _lower_matmul(
     instructions: list[Instruction],
     hardware: HardwareConfig,
     reserved_sram_bytes: int,
+    double_buffer: bool,
 ) -> None:
     operation = scheduled.operation
     lhs, rhs = operation.inputs
@@ -219,15 +244,20 @@ def _lower_matmul(
     tile_m = scheduled.loop("m").tile
     tile_n = scheduled.loop("n").tile
     tile_k = scheduled.loop("k").tile
+    reduction_extents = _tile_extents(k_size, tile_k)
+    buffer_slots = _reduction_buffer_slots(
+        scheduled.loop("k").tiles, double_buffer
+    )
+    buffered_k_extent = _max_buffered_reduction_extent(
+        reduction_extents, buffer_slots
+    )
     for m_offset in range(0, m_size, tile_m):
         m_extent = min(tile_m, m_size - m_offset)
         for n_offset in range(0, n_size, tile_n):
             n_extent = min(tile_n, n_size - n_offset)
-            max_k_extent = min(tile_k, k_size)
             _require_sram(
                 (
-                    m_extent * max_k_extent
-                    + max_k_extent * n_extent
+                    buffered_k_extent * (m_extent + n_extent)
                     + m_extent * n_extent
                 )
                 * output.type.dtype.itemsize,
@@ -241,25 +271,33 @@ def _lower_matmul(
                     {"buffer": "acc", "shape": (m_extent, n_extent)},
                 )
             )
-            for k_offset in range(0, k_size, tile_k):
+            for reduction_index, k_offset in enumerate(
+                range(0, k_size, tile_k)
+            ):
                 k_extent = min(tile_k, k_size - k_offset)
+                lhs_buffer = _reduction_buffer("lhs", reduction_index, buffer_slots)
+                rhs_buffer = _reduction_buffer("rhs", reduction_index, buffer_slots)
                 instructions.extend(
                     (
                         _load(
                             lhs.name,
-                            "lhs",
+                            lhs_buffer,
                             (m_offset, k_offset),
                             (m_extent, k_extent),
                         ),
                         _load(
                             rhs.name,
-                            "rhs",
+                            rhs_buffer,
                             (k_offset, n_offset),
                             (k_extent, n_extent),
                         ),
                         Instruction(
                             Opcode.MATMUL,
-                            {"lhs": "lhs", "rhs": "rhs", "accumulator": "acc"},
+                            {
+                                "lhs": lhs_buffer,
+                                "rhs": rhs_buffer,
+                                "accumulator": "acc",
+                            },
                         ),
                     )
                 )
@@ -378,6 +416,7 @@ def _lower_matmul_bias_relu(
     instructions: list[Instruction],
     hardware: HardwareConfig,
     reserved_sram_bytes: int,
+    double_buffer: bool,
 ) -> None:
     operation = scheduled.operation
     lhs, rhs, bias = operation.inputs
@@ -388,11 +427,20 @@ def _lower_matmul_bias_relu(
     tile_m = scheduled.loop("m").tile
     tile_n = scheduled.loop("n").tile
     tile_k = scheduled.loop("k").tile
+    reduction_extents = _tile_extents(k_size, tile_k)
+    buffer_slots = _reduction_buffer_slots(
+        scheduled.loop("k").tiles, double_buffer
+    )
+    buffered_k_extent = _max_buffered_reduction_extent(
+        reduction_extents, buffer_slots
+    )
+    final_slot_extents = _final_reduction_slot_extents(
+        reduction_extents, buffer_slots
+    )
     for m_offset in range(0, m_size, tile_m):
         m_extent = min(tile_m, m_size - m_offset)
         for n_offset in range(0, n_size, tile_n):
             n_extent = min(tile_n, n_size - n_offset)
-            max_k_extent = min(tile_k, k_size)
             bias_offset, bias_shape = _broadcast_slice(
                 bias.type.shape,
                 output.type.shape,
@@ -401,13 +449,13 @@ def _lower_matmul_bias_relu(
             )
             required = max(
                 (
-                    m_extent * max_k_extent
-                    + max_k_extent * n_extent
+                    buffered_k_extent * (m_extent + n_extent)
                     + m_extent * n_extent
                 )
                 * output.type.dtype.itemsize,
                 (
-                    m_extent * max_k_extent
+                    sum(final_slot_extents) * m_extent
+                    + sum(final_slot_extents[1:]) * n_extent
                     + _element_count(bias_shape)
                     + m_extent * n_extent
                 )
@@ -422,34 +470,47 @@ def _lower_matmul_bias_relu(
                     {"buffer": "acc", "shape": (m_extent, n_extent)},
                 )
             )
-            for k_offset in range(0, k_size, tile_k):
+            for reduction_index, k_offset in enumerate(
+                range(0, k_size, tile_k)
+            ):
                 k_extent = min(tile_k, k_size - k_offset)
+                lhs_buffer = _reduction_buffer("lhs", reduction_index, buffer_slots)
+                rhs_buffer = _reduction_buffer("rhs", reduction_index, buffer_slots)
                 instructions.extend(
                     (
                         _load(
                             lhs.name,
-                            "lhs",
+                            lhs_buffer,
                             (m_offset, k_offset),
                             (m_extent, k_extent),
                         ),
                         _load(
                             rhs.name,
-                            "rhs",
+                            rhs_buffer,
                             (k_offset, n_offset),
                             (k_extent, n_extent),
                         ),
                         Instruction(
                             Opcode.MATMUL,
-                            {"lhs": "lhs", "rhs": "rhs", "accumulator": "acc"},
+                            {
+                                "lhs": lhs_buffer,
+                                "rhs": rhs_buffer,
+                                "accumulator": "acc",
+                            },
                         ),
                     )
                 )
+            bias_buffer = _reduction_buffer("rhs", 0, buffer_slots)
             instructions.extend(
                 (
-                    _load(bias.name, "rhs", bias_offset, bias_shape),
+                    _load(bias.name, bias_buffer, bias_offset, bias_shape),
                     Instruction(
                         Opcode.ADD,
-                        {"lhs": "acc", "rhs": "rhs", "output": "acc"},
+                        {
+                            "lhs": "acc",
+                            "rhs": bias_buffer,
+                            "output": "acc",
+                        },
                     ),
                     Instruction(Opcode.RELU, {"input": "acc", "output": "acc"}),
                     _store(
@@ -467,6 +528,7 @@ def _lower_conv2d(
     instructions: list[Instruction],
     hardware: HardwareConfig,
     reserved_sram_bytes: int,
+    double_buffer: bool,
 ) -> None:
     operation = scheduled.operation
     input_value, weight = operation.inputs
@@ -482,6 +544,13 @@ def _lower_conv2d(
     tile_w = scheduled.loop("w").tile
     tile_oc = scheduled.loop("oc").tile
     tile_ic = scheduled.loop("ic").tile
+    reduction_extents = _tile_extents(input_c, tile_ic)
+    buffer_slots = _reduction_buffer_slots(
+        scheduled.loop("ic").tiles, double_buffer
+    )
+    buffered_ic_extent = _max_buffered_reduction_extent(
+        reduction_extents, buffer_slots
+    )
     n_size, output_h, output_w, output_c = output.type.shape
 
     for n_offset in range(n_size):
@@ -496,22 +565,12 @@ def _lower_conv2d(
                 for oc_offset in range(0, output_c, tile_oc):
                     oc_extent = min(tile_oc, output_c - oc_offset)
                     output_shape = (1, h_extent, w_extent, oc_extent)
-                    max_ic_extent = min(tile_ic, input_c)
-                    max_input_shape = (
-                        1,
-                        input_h_extent,
-                        input_w_extent,
-                        max_ic_extent,
-                    )
-                    max_weight_shape = (
-                        kernel_h,
-                        kernel_w,
-                        max_ic_extent,
-                        oc_extent,
-                    )
                     required = (
-                        _element_count(max_input_shape)
-                        + _element_count(max_weight_shape)
+                        buffered_ic_extent
+                        * (
+                            input_h_extent * input_w_extent
+                            + kernel_h * kernel_w * oc_extent
+                        )
                         + _element_count(output_shape)
                     ) * output.type.dtype.itemsize
                     _require_sram(
@@ -526,8 +585,16 @@ def _lower_conv2d(
                             {"buffer": "acc", "shape": output_shape},
                         )
                     )
-                    for ic_offset in range(0, input_c, tile_ic):
+                    for reduction_index, ic_offset in enumerate(
+                        range(0, input_c, tile_ic)
+                    ):
                         ic_extent = min(tile_ic, input_c - ic_offset)
+                        input_buffer = _reduction_buffer(
+                            "input", reduction_index, buffer_slots
+                        )
+                        weight_buffer = _reduction_buffer(
+                            "weight", reduction_index, buffer_slots
+                        )
                         input_shape = (
                             1,
                             input_h_extent,
@@ -544,7 +611,7 @@ def _lower_conv2d(
                             (
                                 _load(
                                     input_value.name,
-                                    "input",
+                                    input_buffer,
                                     (
                                         n_offset,
                                         input_h_offset,
@@ -556,15 +623,15 @@ def _lower_conv2d(
                                 ),
                                 _load(
                                     weight.name,
-                                    "weight",
+                                    weight_buffer,
                                     (0, 0, ic_offset, oc_offset),
                                     weight_shape,
                                 ),
                                 Instruction(
                                     Opcode.CONV2D,
                                     {
-                                        "input": "input",
-                                        "weight": "weight",
+                                        "input": input_buffer,
+                                        "weight": weight_buffer,
                                         "accumulator": "acc",
                                         "stride": (stride_h, stride_w),
                                         "dilation": (dilation_h, dilation_w),
@@ -587,6 +654,7 @@ def _lower_conv2d_im2col(
     instructions: list[Instruction],
     hardware: HardwareConfig,
     reserved_sram_bytes: int,
+    double_buffer: bool,
 ) -> None:
     operation = scheduled.operation
     input_value, weight = operation.inputs
@@ -602,6 +670,13 @@ def _lower_conv2d_im2col(
     tile_w = scheduled.loop("w").tile
     tile_oc = scheduled.loop("oc").tile
     tile_ic = scheduled.loop("ic").tile
+    reduction_extents = _tile_extents(input_c, tile_ic)
+    buffer_slots = _reduction_buffer_slots(
+        scheduled.loop("ic").tiles, double_buffer
+    )
+    buffered_ic_extent = _max_buffered_reduction_extent(
+        reduction_extents, buffer_slots
+    )
     n_size, output_h, output_w, output_c = output.type.shape
 
     for n_offset in range(n_size):
@@ -617,27 +692,13 @@ def _lower_conv2d_im2col(
                     oc_extent = min(tile_oc, output_c - oc_offset)
                     output_shape = (1, h_extent, w_extent, oc_extent)
                     accumulator_shape = (h_extent * w_extent, oc_extent)
-                    max_ic_extent = min(tile_ic, input_c)
-                    max_input_shape = (
-                        1,
-                        input_h_extent,
-                        input_w_extent,
-                        max_ic_extent,
-                    )
-                    max_weight_shape = (
-                        kernel_h,
-                        kernel_w,
-                        max_ic_extent,
-                        oc_extent,
-                    )
-                    max_columns_shape = (
-                        h_extent * w_extent,
-                        kernel_h * kernel_w * max_ic_extent,
-                    )
                     required = (
-                        _element_count(max_input_shape)
-                        + _element_count(max_weight_shape)
-                        + _element_count(max_columns_shape)
+                        buffered_ic_extent
+                        * (
+                            input_h_extent * input_w_extent
+                            + kernel_h * kernel_w * oc_extent
+                            + h_extent * w_extent * kernel_h * kernel_w
+                        )
                         + _element_count(accumulator_shape)
                     ) * output.type.dtype.itemsize
                     _require_sram(
@@ -652,8 +713,19 @@ def _lower_conv2d_im2col(
                             {"buffer": "acc", "shape": accumulator_shape},
                         )
                     )
-                    for ic_offset in range(0, input_c, tile_ic):
+                    for reduction_index, ic_offset in enumerate(
+                        range(0, input_c, tile_ic)
+                    ):
                         ic_extent = min(tile_ic, input_c - ic_offset)
+                        input_buffer = _reduction_buffer(
+                            "input", reduction_index, buffer_slots
+                        )
+                        columns_buffer = _reduction_buffer(
+                            "lhs", reduction_index, buffer_slots
+                        )
+                        weight_buffer = _reduction_buffer(
+                            "weight", reduction_index, buffer_slots
+                        )
                         input_shape = (
                             1,
                             input_h_extent,
@@ -674,7 +746,7 @@ def _lower_conv2d_im2col(
                             (
                                 _load(
                                     input_value.name,
-                                    "input",
+                                    input_buffer,
                                     (
                                         n_offset,
                                         input_h_offset,
@@ -687,8 +759,8 @@ def _lower_conv2d_im2col(
                                 Instruction(
                                     Opcode.IM2COL,
                                     {
-                                        "input": "input",
-                                        "output": "lhs",
+                                        "input": input_buffer,
+                                        "output": columns_buffer,
                                         "kernel": (kernel_h, kernel_w),
                                         "stride": (stride_h, stride_w),
                                         "dilation": (dilation_h, dilation_w),
@@ -697,15 +769,15 @@ def _lower_conv2d_im2col(
                                 ),
                                 _load(
                                     weight.name,
-                                    "weight",
+                                    weight_buffer,
                                     (0, 0, ic_offset, oc_offset),
                                     weight_shape,
                                 ),
                                 Instruction(
                                     Opcode.RESHAPE,
                                     {
-                                        "input": "weight",
-                                        "output": "weight",
+                                        "input": weight_buffer,
+                                        "output": weight_buffer,
                                         "shape": (
                                             columns_shape[1],
                                             oc_extent,
@@ -715,8 +787,8 @@ def _lower_conv2d_im2col(
                                 Instruction(
                                     Opcode.MATMUL,
                                     {
-                                        "lhs": "lhs",
-                                        "rhs": "weight",
+                                        "lhs": columns_buffer,
+                                        "rhs": weight_buffer,
                                         "accumulator": "acc",
                                     },
                                 ),
@@ -806,6 +878,44 @@ def _store(
 
 def _element_count(shape: tuple[int, ...]) -> int:
     return int(np.prod(shape, dtype=np.int64)) if shape else 1
+
+
+def _reduction_buffer_slots(reduction_tiles: int, double_buffer: bool) -> int:
+    return 2 if double_buffer and reduction_tiles > 1 else 1
+
+
+def _tile_extents(extent: int, tile: int) -> tuple[int, ...]:
+    return tuple(
+        min(tile, extent - offset) for offset in range(0, extent, tile)
+    )
+
+
+def _max_buffered_reduction_extent(
+    reduction_extents: tuple[int, ...], slots: int
+) -> int:
+    if slots == 1:
+        return max(reduction_extents)
+    return max(
+        current + previous
+        for previous, current in zip(
+            reduction_extents, reduction_extents[1:], strict=False
+        )
+    )
+
+
+def _final_reduction_slot_extents(
+    reduction_extents: tuple[int, ...], slots: int
+) -> tuple[int, ...]:
+    final = [0] * slots
+    for index, extent in enumerate(reduction_extents):
+        final[index % slots] = extent
+    return tuple(final)
+
+
+def _reduction_buffer(base: str, reduction_index: int, slots: int) -> str:
+    if slots == 1:
+        return base
+    return f"{base}_{reduction_index % slots}"
 
 
 def _annotate_dma_spaces(

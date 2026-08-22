@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tinyaccel"
-version = "0.5.0"
+version = "0.5.1"
 description = "A minimal AI compiler and accelerator simulator."
 readme = "README.md"
 requires-python = ">=3.10"

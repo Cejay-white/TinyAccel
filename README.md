@@ -28,6 +28,7 @@ python -m examples.conv2d
 python -m examples.layout_transform
 python -m examples.im2col
 python -m examples.resource_overlap
+python -m examples.double_buffer
 ```
 
 The core API is small:
@@ -141,6 +142,7 @@ cycles 0                                      1722
 - Cycle, DRAM/SRAM transfer traffic, and peak SRAM reporting
 - Resource-tagged instruction events and an overlapping ASCII execution timeline
 - Optional DMA/compute/layout resource-conflict and dependency simulation
+- Optional ping/pong buffering and reduction-tile DMA prefetch
 - Hardware configuration and compile-time SRAM capacity checking
 
 ## Optimization pipeline
@@ -314,6 +316,35 @@ resource, so overlapping intervals and resource stalls remain visible:
 python -m examples.resource_overlap
 ```
 
+## Double buffering and tile prefetch
+
+Resource overlap alone cannot hide reduction-tile DMA when every tile reuses
+the same local operand names: the scheduler must preserve the live tile until
+its compute finishes. Enable explicit ping/pong buffers with:
+
+```python
+compiled = tinyaccel.compile(
+    graph,
+    options=tinyaccel.CompileOptions(double_buffer=True),
+    hardware=tinyaccel.HardwareConfig(overlap_resources=True),
+)
+```
+
+MatMul alternates `lhs_0/rhs_0` and `lhs_1/rhs_1`; direct and im2col Conv2D
+similarly alternate their input, weight, and im2col-column buffers across K or
+IC reduction tiles. This lets the DMA unit prefetch the next tile while the
+compute unit consumes the current one. Fused MatMul + bias + ReLU uses the same
+pipeline and safely reuses one RHS slot for the final bias load.
+
+Double buffering keeps instruction work and external traffic unchanged but
+uses more SRAM. The extra operand and im2col-column slots participate in the
+normal compile-time capacity check. A reduction with only one tile
+automatically falls back to one buffer. Run the SRAM/latency comparison with:
+
+```bash
+python -m examples.double_buffer
+```
+
 ## Run tests
 
 ```bash
@@ -327,8 +358,8 @@ python -m unittest discover -v
   planning
 - **v0.4:** NCHW/NHWC Conv2D, layout cost modeling, automatic
   canonicalization, and direct/im2col lowering comparison
-- **v0.5 (current):** resource-tagged timelines, dependency hazards, and
-  optional DMA/compute/layout overlap simulation
+- **v0.5 (current):** resource-tagged timelines, dependency hazards,
+  DMA/compute/layout overlap, and reduction-tile ping/pong prefetch
 - **v0.6:** PyTorch FX frontend and additional backends
 
 TinyAccel is an educational and experimental project. It aims to make the

@@ -37,13 +37,33 @@ class ReferenceExecutor:
             elif operation.op == "matmul_bias_relu":
                 result = np.maximum(inputs[0] @ inputs[1] + inputs[2], 0)
             elif operation.op == "conv2d":
+                input_layout = operation.inputs[0].type.layout
+                weight_layout = operation.inputs[1].type.layout
+                if (input_layout, weight_layout) == ("NHWC", "HWIO"):
+                    canonical_input = inputs[0]
+                    canonical_weight = inputs[1]
+                elif (input_layout, weight_layout) == ("NCHW", "OIHW"):
+                    canonical_input = np.transpose(
+                        inputs[0], layout_permutation("NCHW", "NHWC")
+                    )
+                    canonical_weight = np.transpose(
+                        inputs[1], layout_permutation("OIHW", "HWIO")
+                    )
+                else:
+                    raise RuntimeError(
+                        "conv2d has unsupported input and weight layouts"
+                    )
                 result = conv2d_nhwc(
-                    inputs[0],
-                    inputs[1],
+                    canonical_input,
+                    canonical_weight,
                     stride=operation.attributes["stride"],
                     padding=operation.attributes["padding"],
                     dilation=operation.attributes["dilation"],
                 )
+                if operation.output.type.layout == "NCHW":
+                    result = np.transpose(
+                        result, layout_permutation("NHWC", "NCHW")
+                    )
             else:
                 raise NotImplementedError(
                     f"reference executor does not support {operation.op!r}"

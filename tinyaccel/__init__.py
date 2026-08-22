@@ -14,8 +14,10 @@ from .memory import (
 from .reference import ReferenceExecutor, conv2d_nhwc, evaluate
 from .passes import (
     AlgebraicSimplificationPass,
+    CanonicalizeConv2dLayoutsPass,
     ConstantFoldingPass,
     DeadCodeEliminationPass,
+    LayoutTransformSimplificationPass,
     MatmulBiasReluFusionPass,
     PassManager,
     PassResult,
@@ -27,6 +29,7 @@ from .schedule import LoopSpec, Schedule, ScheduledOperation, create_schedule
 __all__ = [
     "CompileOptions",
     "BufferAllocation",
+    "CanonicalizeConv2dLayoutsPass",
     "ConstantFoldingPass",
     "DeadCodeEliminationPass",
     "Executable",
@@ -41,6 +44,7 @@ __all__ = [
     "ReferenceExecutor",
     "SimulationReport",
     "LoopSpec",
+    "LayoutTransformSimplificationPass",
     "Schedule",
     "ScheduledOperation",
     "TensorType",

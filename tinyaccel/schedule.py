@@ -153,6 +153,7 @@ def create_schedule(
                 tile_ic=tile_ic,
             )
         elif operation.op == "conv2d":
+            _require_canonical_conv2d(operation)
             input_value, weight = operation.inputs
             n_size, output_h, output_w, output_c = operation.output.type.shape
             kernel_h, kernel_w, input_c, _ = weight.type.shape
@@ -268,6 +269,7 @@ def _expected_loop_schema(
             )
         )
     if operation.op == "conv2d":
+        _require_canonical_conv2d(operation)
         n_extent, h_extent, w_extent, oc_extent = operation.output.type.shape
         kh_extent, kw_extent, ic_extent, _ = operation.inputs[1].type.shape
         return (
@@ -280,3 +282,17 @@ def _expected_loop_schema(
             ("ic", ic_extent, "reduction"),
         )
     raise ValueError(f"cannot validate schedule for operation {operation.op!r}")
+
+
+def _require_canonical_conv2d(operation: Operation) -> None:
+    input_value, weight = operation.inputs
+    layouts = (
+        input_value.type.layout,
+        weight.type.layout,
+        operation.output.type.layout,
+    )
+    if layouts != ("NHWC", "HWIO", "NHWC"):
+        raise ValueError(
+            "conv2d schedule requires canonical NHWC/HWIO layouts; "
+            "compile NCHW graphs with optimization enabled"
+        )

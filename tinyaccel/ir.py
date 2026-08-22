@@ -308,19 +308,28 @@ class GraphBuilder:
         dilation: int | Iterable[int] = (1, 1),
         name: str | None = None,
     ) -> Value:
-        """Build a float32 NHWC x HWIO two-dimensional convolution."""
+        """Build a float32 NHWC/HWIO or NCHW/OIHW convolution."""
 
         self._require_defined(input_value, weight)
         self._require_same_dtype("conv2d", input_value, weight)
         if input_value.type.dtype != np.dtype("float32"):
             raise ValueError("conv2d currently requires float32 tensors")
-        if input_value.type.layout != "NHWC" or weight.type.layout != "HWIO":
-            raise ValueError("conv2d currently requires NHWC input and HWIO weight")
+        layouts = (input_value.type.layout, weight.type.layout)
+        if layouts == ("NHWC", "HWIO"):
+            n_size, input_h, input_w, input_c = input_value.type.shape
+            kernel_h, kernel_w, weight_c, output_c = weight.type.shape
+            output_layout = "NHWC"
+        elif layouts == ("NCHW", "OIHW"):
+            n_size, input_c, input_h, input_w = input_value.type.shape
+            output_c, weight_c, kernel_h, kernel_w = weight.type.shape
+            output_layout = "NCHW"
+        else:
+            raise ValueError(
+                "conv2d requires matching NHWC/HWIO or NCHW/OIHW layouts"
+            )
         stride_pair = _normalize_pair("stride", stride)
         dilation_pair = _normalize_pair("dilation", dilation)
         padding_quad = _normalize_padding(padding)
-        n_size, input_h, input_w, input_c = input_value.type.shape
-        kernel_h, kernel_w, weight_c, output_c = weight.type.shape
         if input_c != weight_c:
             raise ValueError(
                 f"conv2d input channels mismatch: {input_c} and {weight_c}"
@@ -333,9 +342,14 @@ class GraphBuilder:
             raise ValueError("conv2d effective kernel exceeds padded input")
         output_h = (padded_h - effective_h) // stride_pair[0] + 1
         output_w = (padded_w - effective_w) // stride_pair[1] + 1
+        output_shape = (
+            (n_size, output_h, output_w, output_c)
+            if output_layout == "NHWC"
+            else (n_size, output_c, output_h, output_w)
+        )
         output = self._new_output(
             name,
-            TensorType((n_size, output_h, output_w, output_c), "float32", "NHWC"),
+            TensorType(output_shape, "float32", output_layout),
         )
         self._operations.append(
             Operation(

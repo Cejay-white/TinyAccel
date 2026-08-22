@@ -7,7 +7,7 @@ from typing import Protocol
 
 import numpy as np
 
-from .ir import Graph, Operation, Value, layout_permutation
+from .ir import Graph, Operation, TensorType, Value, layout_permutation
 
 
 class GraphPass(Protocol):
@@ -44,6 +44,81 @@ class PassManager:
             current.validate()
             results.append(PassResult(graph_pass.name, current))
         return current, tuple(results)
+
+
+class CanonicalizeConv2dLayoutsPass:
+    """Lower NCHW/OIHW Conv2D into the canonical NHWC/HWIO graph form."""
+
+    name = "canonicalize-conv2d-layouts"
+
+    def run(self, graph: Graph) -> Graph:
+        reserved_names = {value.name for value in graph.values}
+
+        def fresh_name(stem: str) -> str:
+            candidate = stem
+            suffix = 0
+            while candidate in reserved_names:
+                suffix += 1
+                candidate = f"{stem}_{suffix}"
+            reserved_names.add(candidate)
+            return candidate
+
+        operations: list[Operation] = []
+        for operation in graph.operations:
+            if operation.op != "conv2d":
+                operations.append(operation)
+                continue
+
+            input_value, weight = operation.inputs
+            layouts = (input_value.type.layout, weight.type.layout)
+            if layouts == ("NHWC", "HWIO"):
+                operations.append(operation)
+                continue
+            if layouts != ("NCHW", "OIHW"):
+                raise ValueError(
+                    "conv2d canonicalization requires NHWC/HWIO or NCHW/OIHW"
+                )
+
+            input_transform = _make_layout_transform(
+                input_value,
+                "NHWC",
+                fresh_name(f"{operation.output.name}_input_nhwc"),
+            )
+            weight_transform = _make_layout_transform(
+                weight,
+                "HWIO",
+                fresh_name(f"{operation.output.name}_weight_hwio"),
+            )
+            canonical_shape = tuple(
+                operation.output.type.shape[axis]
+                for axis in layout_permutation("NCHW", "NHWC")
+            )
+            canonical_output = Value(
+                fresh_name(f"{operation.output.name}_nhwc"),
+                TensorType(canonical_shape, operation.output.type.dtype, "NHWC"),
+            )
+            canonical_conv2d = Operation(
+                "conv2d",
+                (input_transform.output, weight_transform.output),
+                canonical_output,
+                operation.attributes,
+            )
+            output_transform = Operation(
+                "layout_transform",
+                (canonical_output,),
+                operation.output,
+                {"target_layout": "NCHW"},
+            )
+            operations.extend(
+                (
+                    input_transform,
+                    weight_transform,
+                    canonical_conv2d,
+                    output_transform,
+                )
+            )
+
+        return Graph(graph.inputs, operations, graph.outputs)
 
 
 class ConstantFoldingPass:
@@ -132,6 +207,48 @@ class AlgebraicSimplificationPass:
         return Graph(graph.inputs, operations, outputs)
 
 
+class LayoutTransformSimplificationPass:
+    """Eliminate identity and adjacent inverse layout transformations."""
+
+    name = "layout-transform-simplification"
+
+    def run(self, graph: Graph) -> Graph:
+        replacements: dict[Value, Value] = {}
+        producers: dict[Value, Operation] = {}
+        operations: list[Operation] = []
+
+        def resolve(value: Value) -> Value:
+            while value in replacements:
+                value = replacements[value]
+            return value
+
+        for operation in graph.operations:
+            inputs = tuple(resolve(value) for value in operation.inputs)
+            if operation.op == "layout_transform":
+                source = inputs[0]
+                if source.type == operation.output.type:
+                    replacements[operation.output] = source
+                    continue
+                producer = producers.get(source)
+                if (
+                    producer is not None
+                    and producer.op == "layout_transform"
+                    and producer.inputs[0].type == operation.output.type
+                ):
+                    replacements[operation.output] = producer.inputs[0]
+                    continue
+
+            if inputs != operation.inputs:
+                operation = Operation(
+                    operation.op, inputs, operation.output, operation.attributes
+                )
+            operations.append(operation)
+            producers[operation.output] = operation
+
+        outputs = tuple(resolve(value) for value in graph.outputs)
+        return Graph(graph.inputs, operations, outputs)
+
+
 class DeadCodeEliminationPass:
     name = "dead-code-elimination"
 
@@ -196,12 +313,14 @@ class MatmulBiasReluFusionPass:
 
 
 def default_pipeline() -> PassManager:
-    """Return the small, deterministic v0.2 optimization pipeline."""
+    """Return the small, deterministic optimization pipeline."""
 
     return PassManager(
         [
+            CanonicalizeConv2dLayoutsPass(),
             ConstantFoldingPass(),
             AlgebraicSimplificationPass(),
+            LayoutTransformSimplificationPass(),
             MatmulBiasReluFusionPass(),
             DeadCodeEliminationPass(),
         ]
@@ -243,3 +362,20 @@ def _identity_add_operand(
     if lhs in constants and not np.any(constants[lhs]) and rhs.type == output.type:
         return rhs
     return None
+
+
+def _make_layout_transform(
+    source: Value, target_layout: str, output_name: str
+) -> Operation:
+    permutation = layout_permutation(source.type.layout, target_layout)
+    output_shape = tuple(source.type.shape[axis] for axis in permutation)
+    output = Value(
+        output_name,
+        TensorType(output_shape, source.type.dtype, target_layout),
+    )
+    return Operation(
+        "layout_transform",
+        (source,),
+        output,
+        {"target_layout": target_layout},
+    )

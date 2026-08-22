@@ -1,4 +1,4 @@
-"""Transform NCHW/OIHW tensors before running canonical NHWC Conv2D."""
+"""Compile NCHW/OIHW Conv2D through automatic layout canonicalization."""
 
 import numpy as np
 
@@ -9,11 +9,9 @@ def main() -> None:
     builder = tinyaccel.GraphBuilder()
     input_value = builder.input("input", (1, 2, 5, 7), layout="NCHW")
     weight = builder.input("weight", (3, 2, 3, 2), layout="OIHW")
-    nhwc = builder.layout_transform(input_value, "NHWC", name="nhwc")
-    hwio = builder.layout_transform(weight, "HWIO", name="hwio")
     output = builder.conv2d(
-        nhwc,
-        hwio,
+        input_value,
+        weight,
         padding=(1, 1, 0, 1),
         name="output",
     )
@@ -25,13 +23,16 @@ def main() -> None:
             tile_w=7,
             tile_oc=3,
             tile_ic=2,
-            optimize=False,
         ),
     )
 
-    print("Graph IR")
-    print("--------")
+    print("Source NCHW Graph IR")
+    print("--------------------")
     print(graph)
+    print()
+    print("Canonicalized Backend Graph IR")
+    print("------------------------------")
+    print(executable.graph)
     print()
     print("Schedule IR")
     print("-----------")

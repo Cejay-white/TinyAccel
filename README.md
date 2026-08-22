@@ -3,7 +3,7 @@
 **A minimal AI compiler and accelerator simulator for learning how modern AI
 hardware works.**
 
-TinyAccel turns tensor and NHWC convolution graphs into tiled accelerator
+TinyAccel turns tensor and NCHW/NHWC convolution graphs into tiled accelerator
 instructions, executes them on a small functional simulator, and explains the
 cost in cycles and memory traffic. It stays intentionally small so the complete
 path from a multi-operator graph to hardware-style execution remains
@@ -106,13 +106,14 @@ cycles 0                                      1722
 - SSA-like graph IR with static shape and dtype validation
 - Tensor layouts as canonical type metadata (`NHWC`, `NCHW`, `HWIO`, `OIHW`)
 - Explicit tiled layout transforms (`NCHW` <-> `NHWC`, `OIHW` <-> `HWIO`)
-- Float32 NHWC-by-HWIO Conv2D with stride, padding, and dilation
+- Float32 NHWC/HWIO and NCHW/OIHW Conv2D with stride, padding, and dilation
 - Constants, scalar/bias broadcasting, `add`, and `relu`
 - Value producer/user queries and multi-output reference execution
 - Canonical IR printing and validated text parsing
 - NumPy reference executor for correctness checking
 - Composable Pass Manager with per-pass IR snapshots
 - Constant folding, algebraic simplification, and dead-code elimination
+- Conv2D layout canonicalization and redundant transform elimination
 - MatMul + bias + ReLU operator fusion
 - GraphViz DOT graph export
 - Configurable MatMul M/N/K and Conv2D H/W/OC/IC tiling
@@ -135,15 +136,20 @@ cycles 0                                      1722
 Compilation runs a deterministic optimization pipeline by default:
 
 ```text
-Constant Folding
+Conv2D Layout Canonicalization
+      -> Constant Folding
       -> Algebraic Simplification
+      -> Layout Transform Simplification
       -> MatMul + Bias + ReLU Fusion
       -> Dead Code Elimination
 ```
 
-Use `CompileOptions(optimize=False)` to inspect the unoptimized program. The
-fusion example verifies both versions against NumPy and compares instructions,
-cycles, and DRAM/SRAM transfer traffic:
+Use `CompileOptions(optimize=False)` to inspect the unoptimized program. NCHW
+Conv2D compilation requires the default pipeline because the backend schedule
+intentionally accepts only canonical NHWC/HWIO operations. The reference
+executor supports both layout pairs directly. The fusion example verifies both
+optimization modes against NumPy and compares instructions, cycles, and
+DRAM/SRAM transfer traffic:
 
 ```bash
 python -m examples.fusion
@@ -220,11 +226,23 @@ input_nhwc = builder.layout_transform(input_nchw, "NHWC")
 graph = builder.build(input_nhwc)
 ```
 
+Conv2D can also be authored directly in NCHW/OIHW form. The default pipeline
+inserts NCHW-to-NHWC and OIHW-to-HWIO transforms, schedules the canonical
+convolution, then transforms the result back to NCHW:
+
+```python
+builder = tinyaccel.GraphBuilder()
+input_nchw = builder.input("input", (1, 3, 8, 8), layout="NCHW")
+weight_oihw = builder.input("weight", (16, 3, 3, 3), layout="OIHW")
+output_nchw = builder.conv2d(input_nchw, weight_oihw, padding=1)
+compiled = tinyaccel.compile(builder.build(output_nchw))
+```
+
 The reference executor uses the same checked axis permutation as the compiler.
 The backend tiles target-layout axes, loads the corresponding source tile,
 emits `TRANSPOSE`, and stores the target tile. Constant transforms are folded
-by the default optimization pipeline. See the end-to-end NCHW/OIHW Conv2D
-path with:
+and adjacent inverse transforms are eliminated by the default optimization
+pipeline. See the automatic end-to-end NCHW/OIHW Conv2D path with:
 
 ```bash
 python -m examples.layout_transform
@@ -241,9 +259,9 @@ python -m unittest discover -v
 - **v0.2:** multi-operator IR, foundational passes, fusion, and visualization
 - **v0.3:** explicit schedules, lifetime analysis, and memory
   planning
-- **v0.4 (current):** NHWC Conv2D from Graph IR through tiled ISA and simulation
-- **v0.4 next:** automatic NCHW canonicalization, redundant transform
-  elimination, and im2col comparison
+- **v0.4 (current):** NCHW/NHWC Conv2D, explicit layout transforms, and
+  automatic canonicalization through tiled ISA and simulation
+- **v0.4 next:** layout cost modeling and im2col comparison
 - **v0.5:** richer ISA, timelines, and resource-conflict simulation
 - **v0.6:** PyTorch FX frontend and additional backends
 

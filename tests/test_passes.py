@@ -33,8 +33,10 @@ class OptimizationPassTests(unittest.TestCase):
         optimized, trace = tinyaccel.default_pipeline().run_with_trace(graph)
 
         self.assertEqual([result.pass_name for result in trace], [
+            "canonicalize-conv2d-layouts",
             "constant-folding",
             "algebraic-simplification",
+            "layout-transform-simplification",
             "matmul-bias-relu-fusion",
             "dead-code-elimination",
         ])

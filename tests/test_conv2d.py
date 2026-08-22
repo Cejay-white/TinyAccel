@@ -53,12 +53,12 @@ class LayoutAndConvIrTests(unittest.TestCase):
         self.assertEqual(graph.outputs[0].type.shape, (2, 4, 5, 5))
         self.assertEqual(graph.outputs[0].type.layout, "NHWC")
 
-    def test_conv2d_requires_nhwc_and_hwio(self) -> None:
+    def test_conv2d_requires_compatible_layout_pairs(self) -> None:
         builder = tinyaccel.GraphBuilder()
         input_value = builder.input("input", (1, 5, 5, 2), layout="NCHW")
         weight = builder.input("weight", (3, 3, 2, 4), layout="HWIO")
 
-        with self.assertRaisesRegex(ValueError, "NHWC input and HWIO weight"):
+        with self.assertRaisesRegex(ValueError, "matching NHWC/HWIO or NCHW/OIHW"):
             builder.conv2d(input_value, weight)
 
     def test_conv2d_ir_round_trips_layout_and_attributes(self) -> None:

@@ -3,16 +3,17 @@
 **A minimal AI compiler and accelerator simulator for learning how modern AI
 hardware works.**
 
-TinyAccel turns tensor and NCHW/NHWC convolution graphs into tiled accelerator
-instructions, executes them on a small functional simulator, and explains the
-cost in cycles and memory traffic. It stays intentionally small so the complete
-path from a multi-operator graph to hardware-style execution remains
-understandable.
+TinyAccel turns tensor, PyTorch FX, and NCHW/NHWC convolution graphs into tiled
+accelerator instructions, executes them on a small functional simulator, and
+explains the cost in cycles and memory traffic. It stays intentionally small so
+the complete path from a multi-operator graph to hardware-style execution
+remains understandable.
 
 ```text
-Tensor Graph -> Graph IR -> Schedule -> Memory Plan -> TinyAccel ISA -> Simulator
-                                                                       |
-                                               Result + cycle/memory report
+Tensor Graph --+
+PyTorch FX -----+-> Graph IR -> Schedule -> Memory Plan -> TinyAccel ISA
+                                                                  |
+                                                  Simulator -> Result/report
 ```
 
 ## Quick start
@@ -29,6 +30,7 @@ python -m examples.layout_transform
 python -m examples.im2col
 python -m examples.resource_overlap
 python -m examples.double_buffer
+python -m examples.torch_fx
 ```
 
 The core API is small:
@@ -143,6 +145,7 @@ cycles 0                                      1722
 - Resource-tagged instruction events and an overlapping ASCII execution timeline
 - Optional DMA/compute/layout resource-conflict and dependency simulation
 - Optional ping/pong buffering and reduction-tile DMA prefetch
+- Optional PyTorch FX import for placeholders, parameters, MatMul, Add, and ReLU
 - Hardware configuration and compile-time SRAM capacity checking
 
 ## Optimization pipeline
@@ -345,6 +348,51 @@ automatically falls back to one buffer. Run the SRAM/latency comparison with:
 python -m examples.double_buffer
 ```
 
+## PyTorch FX frontend
+
+PyTorch is an optional dependency so the compiler and simulator remain small.
+Install the frontend extra when tracing real modules:
+
+```bash
+python -m pip install -e ".[torch]"
+```
+
+`trace_torch_module` uses `torch.fx.symbolic_trace`, derives static input types
+from example tensors, imports parameters and buffers from `get_attr` nodes as
+TinyAccel constants, and returns the normal TinyAccel graph:
+
+```python
+import torch
+import tinyaccel
+
+class TinyMlp(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(5, 4))
+        self.bias = torch.nn.Parameter(torch.randn(4))
+
+    def forward(self, value):
+        return torch.relu(value @ self.weight + self.bias)
+
+example = torch.randn(3, 5)
+graph = tinyaccel.trace_torch_module(TinyMlp().eval(), example)
+compiled = tinyaccel.compile(graph)
+```
+
+The importer follows the
+[public FX node protocol](https://docs.pytorch.org/docs/stable/fx.html) and
+currently supports `placeholder`, nested `get_attr`,
+`call_function`/`call_method` MatMul, Add and ReLU, plus flat single or multiple
+outputs. Scalar Add literals are converted to constants. In-place ReLU, scaled
+Add (`alpha != 1`), and `call_module` nodes are rejected explicitly instead of
+being guessed. Advanced users can pass an existing FX `GraphModule` to
+`from_torch_fx` with explicit input specs and optional activation/parameter
+layouts.
+
+```bash
+python -m examples.torch_fx
+```
+
 ## Run tests
 
 ```bash
@@ -358,9 +406,11 @@ python -m unittest discover -v
   planning
 - **v0.4:** NCHW/NHWC Conv2D, layout cost modeling, automatic
   canonicalization, and direct/im2col lowering comparison
-- **v0.5 (current):** resource-tagged timelines, dependency hazards,
+- **v0.5:** resource-tagged timelines, dependency hazards,
   DMA/compute/layout overlap, and reduction-tile ping/pong prefetch
-- **v0.6:** PyTorch FX frontend and additional backends
+- **v0.6 (current):** optional PyTorch FX import for primitive MatMul/Add/ReLU
+  graphs and parameter capture
+- **v0.7:** FX Linear/Conv2d module lowering and additional backends
 
 TinyAccel is an educational and experimental project. It aims to make the
 compiler-to-hardware path concrete, not to replace production compiler stacks.

@@ -25,6 +25,7 @@ from .passes import (
 )
 from .simulator import ExecutionResource, SimulationReport, TimelineEvent
 from .schedule import LoopSpec, Schedule, ScheduledOperation, create_schedule
+from .torch_fx import from_torch_fx, trace_torch_module
 
 __all__ = [
     "CompileOptions",
@@ -56,9 +57,11 @@ __all__ = [
     "conv2d_nhwc",
     "create_schedule",
     "evaluate",
+    "from_torch_fx",
     "layout_permutation",
     "analyze_lifetimes",
     "default_pipeline",
     "parse_graph",
     "plan_memory",
+    "trace_torch_module",
 ]

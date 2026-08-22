@@ -7,6 +7,14 @@ from dataclasses import dataclass
 from .ir import Graph, Operation
 
 
+_LAYOUT_AXES = {
+    "NCHW": ("n", "c", "h", "w"),
+    "NHWC": ("n", "h", "w", "c"),
+    "OIHW": ("oc", "ic", "kh", "kw"),
+    "HWIO": ("kh", "kw", "ic", "oc"),
+}
+
+
 @dataclass(frozen=True)
 class LoopSpec:
     """One scheduled loop axis."""
@@ -136,6 +144,14 @@ def create_schedule(
             )
         elif operation.op in {"add", "relu"}:
             loops = _elementwise_loops(operation, tile_m, tile_n)
+        elif operation.op == "layout_transform":
+            loops = _layout_transform_loops(
+                operation,
+                tile_h=tile_h,
+                tile_w=tile_w,
+                tile_oc=tile_oc,
+                tile_ic=tile_ic,
+            )
         elif operation.op == "conv2d":
             input_value, weight = operation.inputs
             n_size, output_h, output_w, output_c = operation.output.type.shape
@@ -168,6 +184,34 @@ def _elementwise_loops(
             tile = min(tile_m, extent)
         loops.append(LoopSpec(f"d{index}", extent, tile))
     return tuple(loops)
+
+
+def _layout_transform_loops(
+    operation: Operation,
+    *,
+    tile_h: int,
+    tile_w: int,
+    tile_oc: int,
+    tile_ic: int,
+) -> tuple[LoopSpec, ...]:
+    layout = operation.output.type.layout
+    if layout is None:
+        raise ValueError("layout_transform output must carry a layout")
+    axes = _LAYOUT_AXES[layout]
+    requested_tiles = {
+        "n": 1,
+        "h": tile_h,
+        "w": tile_w,
+        "c": tile_ic,
+        "oc": tile_oc,
+        "ic": tile_ic,
+        "kh": tile_h,
+        "kw": tile_w,
+    }
+    return tuple(
+        LoopSpec(axis, extent, min(requested_tiles[axis], extent))
+        for axis, extent in zip(axes, operation.output.type.shape, strict=True)
+    )
 
 
 def _validate_operation_loops(
@@ -212,6 +256,16 @@ def _expected_loop_schema(
         return tuple(
             (f"d{index}", extent, "spatial")
             for index, extent in enumerate(operation.output.type.shape)
+        )
+    if operation.op == "layout_transform":
+        layout = operation.output.type.layout
+        if layout is None:
+            raise ValueError("layout_transform output must carry a layout")
+        return tuple(
+            (axis, extent, "spatial")
+            for axis, extent in zip(
+                _LAYOUT_AXES[layout], operation.output.type.shape, strict=True
+            )
         )
     if operation.op == "conv2d":
         n_extent, h_extent, w_extent, oc_extent = operation.output.type.shape

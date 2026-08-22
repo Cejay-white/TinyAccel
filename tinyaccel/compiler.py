@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Iterable
 import numpy as np
 
 from .hardware import HardwareConfig
-from .ir import Graph, TensorType
+from .ir import Graph, TensorType, layout_permutation
 from .isa import Instruction, MemorySpace, Opcode, Program
 from .memory import MemoryPlan, plan_memory
 from .passes import default_pipeline
@@ -144,6 +144,10 @@ def compile(
             _lower_add(scheduled, instructions, hardware, memory_plan.total_bytes)
         elif operation.op == "relu":
             _lower_relu(scheduled, instructions, hardware, memory_plan.total_bytes)
+        elif operation.op == "layout_transform":
+            _lower_layout_transform(
+                scheduled, instructions, hardware, memory_plan.total_bytes
+            )
         elif operation.op == "matmul_bias_relu":
             _lower_matmul_bias_relu(
                 scheduled, instructions, hardware, memory_plan.total_bytes
@@ -310,6 +314,50 @@ def _lower_relu(
                 _load(source.name, "lhs", offset, shape),
                 Instruction(Opcode.RELU, {"input": "lhs", "output": "acc"}),
                 _store("acc", output.name, offset, shape),
+            )
+        )
+
+
+def _lower_layout_transform(
+    scheduled: ScheduledOperation,
+    instructions: list[Instruction],
+    hardware: HardwareConfig,
+    reserved_sram_bytes: int,
+) -> None:
+    operation = scheduled.operation
+    source = operation.inputs[0]
+    output = operation.output
+    permutation = layout_permutation(source.type.layout, output.type.layout)
+    for output_offset, output_shape in _output_tiles(output.type, scheduled):
+        input_offset = [0] * len(permutation)
+        input_shape = [0] * len(permutation)
+        for output_axis, input_axis in enumerate(permutation):
+            input_offset[input_axis] = output_offset[output_axis]
+            input_shape[input_axis] = output_shape[output_axis]
+        required = 2 * _element_count(output_shape) * output.type.dtype.itemsize
+        _require_sram(
+            required,
+            hardware,
+            "layout_transform tile",
+            reserved_sram_bytes,
+        )
+        instructions.extend(
+            (
+                _load(
+                    source.name,
+                    "input",
+                    tuple(input_offset),
+                    tuple(input_shape),
+                ),
+                Instruction(
+                    Opcode.TRANSPOSE,
+                    {
+                        "input": "input",
+                        "output": "acc",
+                        "permutation": permutation,
+                    },
+                ),
+                _store("acc", output.name, output_offset, output_shape),
             )
         )
 

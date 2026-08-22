@@ -243,6 +243,13 @@ class Simulator:
             cycles = ceil(result.size / self.hardware.macs_per_cycle)
             return cycles, 0, 0, 0, 0
 
+        if instruction.opcode is Opcode.TRANSPOSE:
+            source = buffers[operands["input"]]
+            result = np.transpose(source, operands["permutation"]).copy()
+            buffers[operands["output"]] = result
+            cycles = ceil(result.size / self.hardware.macs_per_cycle)
+            return cycles, 0, 0, 0, 0
+
         if instruction.opcode is Opcode.CONV2D:
             input_tile = buffers[operands["input"]]
             weight = buffers[operands["weight"]]

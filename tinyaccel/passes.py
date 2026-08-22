@@ -7,7 +7,7 @@ from typing import Protocol
 
 import numpy as np
 
-from .ir import Graph, Operation, Value
+from .ir import Graph, Operation, Value, layout_permutation
 
 
 class GraphPass(Protocol):
@@ -63,12 +63,19 @@ class ConstantFoldingPass:
                 continue
 
             if (
-                operation.op in {"matmul", "add", "relu", "matmul_bias_relu"}
+                operation.op
+                in {
+                    "matmul",
+                    "add",
+                    "relu",
+                    "layout_transform",
+                    "matmul_bias_relu",
+                }
                 and operation.inputs
                 and all(value in constants for value in operation.inputs)
             ):
                 inputs = [constants[value] for value in operation.inputs]
-                folded = _evaluate_operation(operation.op, inputs)
+                folded = _evaluate_operation(operation, inputs)
                 folded = np.asarray(folded, dtype=operation.output.type.dtype)
                 if folded.shape != operation.output.type.shape:
                     raise RuntimeError(
@@ -201,16 +208,26 @@ def default_pipeline() -> PassManager:
     )
 
 
-def _evaluate_operation(op: str, inputs: list[np.ndarray]) -> np.ndarray:
-    if op == "matmul":
+def _evaluate_operation(
+    operation: Operation, inputs: list[np.ndarray]
+) -> np.ndarray:
+    if operation.op == "matmul":
         return inputs[0] @ inputs[1]
-    if op == "add":
+    if operation.op == "add":
         return inputs[0] + inputs[1]
-    if op == "relu":
+    if operation.op == "relu":
         return np.maximum(inputs[0], 0)
-    if op == "matmul_bias_relu":
+    if operation.op == "layout_transform":
+        permutation = layout_permutation(
+            operation.inputs[0].type.layout,
+            operation.output.type.layout,
+        )
+        return np.transpose(inputs[0], permutation)
+    if operation.op == "matmul_bias_relu":
         return np.maximum(inputs[0] @ inputs[1] + inputs[2], 0)
-    raise NotImplementedError(f"constant folding does not support {op!r}")
+    raise NotImplementedError(
+        f"constant folding does not support {operation.op!r}"
+    )
 
 
 def _identity_add_operand(

@@ -25,6 +25,7 @@ python -m examples.matmul
 python -m examples.fusion
 python -m examples.schedule_memory
 python -m examples.conv2d
+python -m examples.layout_transform
 ```
 
 The core API is small:
@@ -104,6 +105,7 @@ cycles 0                                      1722
 
 - SSA-like graph IR with static shape and dtype validation
 - Tensor layouts as canonical type metadata (`NHWC`, `NCHW`, `HWIO`, `OIHW`)
+- Explicit tiled layout transforms (`NCHW` <-> `NHWC`, `OIHW` <-> `HWIO`)
 - Float32 NHWC-by-HWIO Conv2D with stride, padding, and dilation
 - Constants, scalar/bias broadcasting, `add`, and `relu`
 - Value producer/user queries and multi-output reference execution
@@ -121,8 +123,8 @@ cycles 0                                      1722
 - Alignment-aware linear-scan SRAM planning with buffer reuse
 - Arena-backed simulation of planned intermediate tensors
 - Multi-operator tiled lowering with broadcast-aware DMA slices
-- Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, `ADD`, `RELU`, `CONV2D`, and
-  `DMA_STORE` instructions
+- Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, `ADD`, `RELU`, `TRANSPOSE`,
+  `CONV2D`, and `DMA_STORE` instructions
 - Functional accelerator simulation checked against NumPy
 - Cycle, DRAM/SRAM transfer traffic, and peak SRAM reporting
 - Per-instruction cycle events and an ASCII execution timeline
@@ -194,7 +196,7 @@ experiments that also retain graph outputs in the arena.
 DMA instructions expose the persistent value's memory space as `space=DRAM` or
 `space=SRAM`. Reported SRAM traffic covers the DMA-side movement through local
 tile buffers and the planned arena; it does not yet include compute-unit SRAM
-accesses made internally by MatMul, Conv2D, Add, or ReLU.
+accesses made internally by MatMul, Conv2D, Add, ReLU, or Transpose.
 
 For Conv2D, `CompileOptions(tile_ic=...)` controls reduction tiling over input
 channels. Each output tile is zeroed once, accumulates all IC partial results,
@@ -204,6 +206,29 @@ SRAM capacity without changing graph semantics.
 Schedule construction validates the exact axis order, extent, and
 spatial/reduction kind required by each operation. Tiles must not exceed their
 loop extents, and scheduled operations must match graph program order.
+
+## Layout transformations
+
+`layout_transform` makes physical layout changes explicit in the graph. It
+infers the permuted shape, preserves dtype, and carries the target layout in
+both the operation attributes and output type:
+
+```python
+builder = tinyaccel.GraphBuilder()
+input_nchw = builder.input("input", (1, 3, 8, 8), layout="NCHW")
+input_nhwc = builder.layout_transform(input_nchw, "NHWC")
+graph = builder.build(input_nhwc)
+```
+
+The reference executor uses the same checked axis permutation as the compiler.
+The backend tiles target-layout axes, loads the corresponding source tile,
+emits `TRANSPOSE`, and stores the target tile. Constant transforms are folded
+by the default optimization pipeline. See the end-to-end NCHW/OIHW Conv2D
+path with:
+
+```bash
+python -m examples.layout_transform
+```
 
 ## Run tests
 
@@ -217,7 +242,8 @@ python -m unittest discover -v
 - **v0.3:** explicit schedules, lifetime analysis, and memory
   planning
 - **v0.4 (current):** NHWC Conv2D from Graph IR through tiled ISA and simulation
-- **v0.4 next:** NCHW, layout transformations, and im2col comparison
+- **v0.4 next:** automatic NCHW canonicalization, redundant transform
+  elimination, and im2col comparison
 - **v0.5:** richer ISA, timelines, and resource-conflict simulation
 - **v0.6:** PyTorch FX frontend and additional backends
 

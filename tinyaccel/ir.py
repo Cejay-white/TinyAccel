@@ -13,6 +13,29 @@ import numpy as np
 _IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_]*"
 _TENSOR_TYPE_SYNTAX = r"tensor<[^>]+>"
 _LAYOUTS = frozenset({"NCHW", "NHWC", "OIHW", "HWIO"})
+_LAYOUT_PERMUTATIONS = {
+    ("NCHW", "NHWC"): (0, 2, 3, 1),
+    ("NHWC", "NCHW"): (0, 3, 1, 2),
+    ("OIHW", "HWIO"): (2, 3, 1, 0),
+    ("HWIO", "OIHW"): (3, 2, 0, 1),
+}
+
+
+def layout_permutation(
+    source_layout: str | None, target_layout: str
+) -> tuple[int, int, int, int]:
+    """Return the physical-axis permutation for a supported layout change."""
+
+    if source_layout is None:
+        raise ValueError("layout_transform requires a source layout")
+    source = str(source_layout).upper()
+    target = str(target_layout).upper()
+    try:
+        return _LAYOUT_PERMUTATIONS[(source, target)]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported layout transform: {source} -> {target}"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -249,6 +272,32 @@ class GraphBuilder:
         self._operations.append(Operation("relu", (value,), output))
         return output
 
+    def layout_transform(
+        self,
+        value: Value,
+        target_layout: str,
+        name: str | None = None,
+    ) -> Value:
+        """Reorder a rank-4 tensor between supported activation/weight layouts."""
+
+        self._require_defined(value)
+        target = str(target_layout).upper()
+        permutation = layout_permutation(value.type.layout, target)
+        output_shape = tuple(value.type.shape[axis] for axis in permutation)
+        output = self._new_output(
+            name,
+            TensorType(output_shape, value.type.dtype, target),
+        )
+        self._operations.append(
+            Operation(
+                "layout_transform",
+                (value,),
+                output,
+                {"target_layout": target},
+            )
+        )
+        return output
+
     def conv2d(
         self,
         input_value: Value,
@@ -439,6 +488,14 @@ def parse_graph(text: str) -> Graph:
             result = builder.add(operands[0], operands[1], name=output_name)
         elif op_name == "relu" and len(operands) == 1 and not attributes:
             result = builder.relu(operands[0], name=output_name)
+        elif op_name == "layout_transform" and len(operands) == 1:
+            if set(attributes) != {"target_layout"}:
+                raise ValueError(
+                    "layout_transform requires exactly one 'target_layout' attribute"
+                )
+            result = builder.layout_transform(
+                operands[0], attributes["target_layout"], name=output_name
+            )
         elif (
             op_name == "matmul_bias_relu"
             and len(operands) == 3

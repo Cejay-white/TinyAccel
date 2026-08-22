@@ -6,7 +6,7 @@ from typing import Mapping
 
 import numpy as np
 
-from .ir import Graph
+from .ir import Graph, layout_permutation
 
 
 class ReferenceExecutor:
@@ -28,6 +28,12 @@ class ReferenceExecutor:
                 result = inputs[0] + inputs[1]
             elif operation.op == "relu":
                 result = np.maximum(inputs[0], 0)
+            elif operation.op == "layout_transform":
+                permutation = layout_permutation(
+                    operation.inputs[0].type.layout,
+                    operation.output.type.layout,
+                )
+                result = np.transpose(inputs[0], permutation)
             elif operation.op == "matmul_bias_relu":
                 result = np.maximum(inputs[0] @ inputs[1] + inputs[2], 0)
             elif operation.op == "conv2d":

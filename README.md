@@ -26,6 +26,7 @@ python -m examples.fusion
 python -m examples.schedule_memory
 python -m examples.conv2d
 python -m examples.layout_transform
+python -m examples.im2col
 ```
 
 The core API is small:
@@ -74,6 +75,7 @@ MATMUL     instructions=30   cycles=720
 DMA_STORE  instructions=6    cycles=144
 ----------------------------
 Total cycles:       1722
+Layout cycles:      0
 DRAM bytes read:    26880
 DRAM bytes written: 4608
 SRAM bytes read:    4608
@@ -82,8 +84,8 @@ Peak SRAM bytes:    2048
 ```
 
 The simulator currently models instructions sequentially. Cycle counts are an
-analytical estimate based on configurable DMA bandwidth and MAC throughput,
-not a cycle-accurate hardware model.
+analytical estimate based on configurable DMA bandwidth, MAC throughput, and
+vector layout throughput, not a cycle-accurate hardware model.
 
 `compiled.timeline()` renders the measured instruction events as a compact
 ASCII Gantt chart. Large programs retain their first and last events while the
@@ -120,12 +122,13 @@ cycles 0                                      1722
 - Explicit spatial/reduction loop schedules used by ISA lowering
 - Conv2D schedules over `N/H/W/OC` and reductions over `KH/KW/IC`
 - Partial Conv2D accumulation across configurable input-channel tiles
+- Selectable direct or explicit im2col + MatMul Conv2D lowering
 - SSA value lifetime analysis
 - Alignment-aware linear-scan SRAM planning with buffer reuse
 - Arena-backed simulation of planned intermediate tensors
 - Multi-operator tiled lowering with broadcast-aware DMA slices
-- Human-readable `ZERO`, `DMA_LOAD`, `MATMUL`, `ADD`, `RELU`, `TRANSPOSE`,
-  `CONV2D`, and `DMA_STORE` instructions
+- Human-readable `ZERO`, `DMA_LOAD`, `IM2COL`, `RESHAPE`, `MATMUL`, `ADD`,
+  `RELU`, `TRANSPOSE`, `CONV2D`, and `DMA_STORE` instructions
 - Functional accelerator simulation checked against NumPy
 - Cycle, DRAM/SRAM transfer traffic, and peak SRAM reporting
 - Per-instruction cycle events and an ASCII execution timeline
@@ -202,7 +205,7 @@ experiments that also retain graph outputs in the arena.
 DMA instructions expose the persistent value's memory space as `space=DRAM` or
 `space=SRAM`. Reported SRAM traffic covers the DMA-side movement through local
 tile buffers and the planned arena; it does not yet include compute-unit SRAM
-accesses made internally by MatMul, Conv2D, Add, ReLU, or Transpose.
+accesses made internally by MatMul, Conv2D, Add, ReLU, Transpose, or Im2col.
 
 For Conv2D, `CompileOptions(tile_ic=...)` controls reduction tiling over input
 channels. Each output tile is zeroed once, accumulates all IC partial results,
@@ -248,6 +251,33 @@ pipeline. See the automatic end-to-end NCHW/OIHW Conv2D path with:
 python -m examples.layout_transform
 ```
 
+## Direct vs im2col Conv2D
+
+Conv2D defaults to the direct tiled `CONV2D` instruction. Set
+`conv2d_lowering="im2col"` to materialize each input patch tile and execute the
+same convolution through `MATMUL`:
+
+```python
+im2col = tinyaccel.compile(
+    graph,
+    options=tinyaccel.CompileOptions(conv2d_lowering="im2col"),
+)
+```
+
+Both paths use the same spatial/reduction schedule, padding semantics, IC
+tiling, DMA slices, and numerical reference. The im2col path emits
+`IM2COL -> RESHAPE -> MATMUL`, accounts for the materialized columns in its
+compile-time SRAM requirement, and treats `RESHAPE` as a zero-cycle view.
+
+`HardwareConfig(vector_elements_per_cycle=...)` controls `TRANSPOSE` and
+`IM2COL` throughput. `SimulationReport.layout_cycles` aggregates the cycles
+spent in `TRANSPOSE`, `IM2COL`, and `RESHAPE`, making layout overhead explicit
+beside total cycles and peak SRAM. Run the side-by-side comparison with:
+
+```bash
+python -m examples.im2col
+```
+
 ## Run tests
 
 ```bash
@@ -259,9 +289,8 @@ python -m unittest discover -v
 - **v0.2:** multi-operator IR, foundational passes, fusion, and visualization
 - **v0.3:** explicit schedules, lifetime analysis, and memory
   planning
-- **v0.4 (current):** NCHW/NHWC Conv2D, explicit layout transforms, and
-  automatic canonicalization through tiled ISA and simulation
-- **v0.4 next:** layout cost modeling and im2col comparison
+- **v0.4 (current):** NCHW/NHWC Conv2D, layout cost modeling, automatic
+  canonicalization, and direct/im2col lowering comparison
 - **v0.5:** richer ISA, timelines, and resource-conflict simulation
 - **v0.6:** PyTorch FX frontend and additional backends
 

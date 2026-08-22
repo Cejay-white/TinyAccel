@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 class Opcode(str, Enum):
     ZERO = "ZERO"
     DMA_LOAD = "DMA_LOAD"
+    IM2COL = "IM2COL"
+    RESHAPE = "RESHAPE"
     MATMUL = "MATMUL"
     ADD = "ADD"
     RELU = "RELU"

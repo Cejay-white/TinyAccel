@@ -10,12 +10,14 @@ class HardwareConfig:
     sram_bytes: int = 256 * 1024
     dma_bytes_per_cycle: int = 32
     macs_per_cycle: int = 64
+    vector_elements_per_cycle: int = 64
 
     def __post_init__(self) -> None:
         for name, value in (
             ("sram_bytes", self.sram_bytes),
             ("dma_bytes_per_cycle", self.dma_bytes_per_cycle),
             ("macs_per_cycle", self.macs_per_cycle),
+            ("vector_elements_per_cycle", self.vector_elements_per_cycle),
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")

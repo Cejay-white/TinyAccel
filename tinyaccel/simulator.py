@@ -37,6 +37,15 @@ class SimulationReport:
     sram_bytes_read: int = 0
     sram_bytes_written: int = 0
 
+    @property
+    def layout_cycles(self) -> int:
+        """Cycles spent materializing layout-changing local operations."""
+
+        return sum(
+            self.cycles_by_opcode.get(opcode.value, 0)
+            for opcode in (Opcode.TRANSPOSE, Opcode.IM2COL, Opcode.RESHAPE)
+        )
+
     def __str__(self) -> str:
         lines = ["TinyAccel Simulation Report", "=" * 28]
         for opcode in Opcode:
@@ -49,6 +58,7 @@ class SimulationReport:
             (
                 "-" * 28,
                 f"Total cycles:       {self.total_cycles}",
+                f"Layout cycles:      {self.layout_cycles}",
                 f"DRAM bytes read:    {self.dram_bytes_read}",
                 f"DRAM bytes written: {self.dram_bytes_written}",
                 f"SRAM bytes read:    {self.sram_bytes_read}",
@@ -222,6 +232,26 @@ class Simulator:
             sram_read = transferred_bytes if source_space is MemorySpace.SRAM else 0
             return cycles, dram_read, 0, sram_read, tile.nbytes
 
+        if instruction.opcode is Opcode.IM2COL:
+            source = buffers[operands["input"]]
+            result = _im2col(
+                source,
+                kernel=operands["kernel"],
+                stride=operands["stride"],
+                dilation=operands["dilation"],
+                output_shape=operands["output_shape"],
+            )
+            buffers[operands["output"]] = result
+            cycles = ceil(
+                result.size / self.hardware.vector_elements_per_cycle
+            )
+            return cycles, 0, 0, 0, 0
+
+        if instruction.opcode is Opcode.RESHAPE:
+            source = buffers[operands["input"]]
+            buffers[operands["output"]] = source.reshape(operands["shape"])
+            return 0, 0, 0, 0, 0
+
         if instruction.opcode is Opcode.MATMUL:
             lhs = buffers[operands["lhs"]]
             rhs = buffers[operands["rhs"]]
@@ -247,7 +277,9 @@ class Simulator:
             source = buffers[operands["input"]]
             result = np.transpose(source, operands["permutation"]).copy()
             buffers[operands["output"]] = result
-            cycles = ceil(result.size / self.hardware.macs_per_cycle)
+            cycles = ceil(
+                result.size / self.hardware.vector_elements_per_cycle
+            )
             return cycles, 0, 0, 0, 0
 
         if instruction.opcode is Opcode.CONV2D:
@@ -334,6 +366,47 @@ def _read_tile(
         slice(start, start + extent) for start, extent in zip(offset, shape)
     )
     return source[slices].copy()
+
+
+def _im2col(
+    input_tile: np.ndarray,
+    *,
+    kernel: tuple[int, int],
+    stride: tuple[int, int],
+    dilation: tuple[int, int],
+    output_shape: tuple[int, int],
+) -> np.ndarray:
+    """Materialize one NHWC input tile as a two-dimensional patch matrix."""
+
+    if input_tile.ndim != 4 or input_tile.shape[0] != 1:
+        raise ValueError("IM2COL requires an NHWC tile with batch extent one")
+    kernel_h, kernel_w = kernel
+    stride_h, stride_w = stride
+    dilation_h, dilation_w = dilation
+    output_h, output_w = output_shape
+    input_c = input_tile.shape[3]
+    columns = np.empty(
+        (output_h * output_w, kernel_h * kernel_w * input_c),
+        dtype=input_tile.dtype,
+    )
+    row = 0
+    effective_h = (kernel_h - 1) * dilation_h + 1
+    effective_w = (kernel_w - 1) * dilation_w + 1
+    for output_y in range(output_h):
+        input_y = output_y * stride_h
+        for output_x in range(output_w):
+            input_x = output_x * stride_w
+            patch = input_tile[
+                0,
+                input_y : input_y + effective_h : dilation_h,
+                input_x : input_x + effective_w : dilation_w,
+                :,
+            ]
+            if patch.shape != (kernel_h, kernel_w, input_c):
+                raise ValueError("IM2COL input tile does not cover the output patch")
+            columns[row, :] = patch.reshape(-1)
+            row += 1
+    return columns
 
 
 def _read_padded_tile(

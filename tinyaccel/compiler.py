@@ -31,6 +31,7 @@ class CompileOptions:
     tile_oc: int = 16
     optimize: bool = True
     tile_ic: int = 16
+    conv2d_lowering: str = "direct"
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -44,6 +45,11 @@ class CompileOptions:
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if self.conv2d_lowering not in {"direct", "im2col"}:
+            raise ValueError(
+                "conv2d_lowering must be 'direct' or 'im2col', got "
+                f"{self.conv2d_lowering!r}"
+            )
 
 
 class Executable:
@@ -153,9 +159,14 @@ def compile(
                 scheduled, instructions, hardware, memory_plan.total_bytes
             )
         elif operation.op == "conv2d":
-            _lower_conv2d(
-                scheduled, instructions, hardware, memory_plan.total_bytes
-            )
+            if options.conv2d_lowering == "direct":
+                _lower_conv2d(
+                    scheduled, instructions, hardware, memory_plan.total_bytes
+                )
+            else:
+                _lower_conv2d_im2col(
+                    scheduled, instructions, hardware, memory_plan.total_bytes
+                )
         else:
             raise NotImplementedError(
                 f"accelerator backend does not support {operation.op!r}"
@@ -567,6 +578,166 @@ def _lower_conv2d(
                             output.name,
                             (n_offset, h_offset, w_offset, oc_offset),
                             output_shape,
+                        )
+                    )
+
+
+def _lower_conv2d_im2col(
+    scheduled: ScheduledOperation,
+    instructions: list[Instruction],
+    hardware: HardwareConfig,
+    reserved_sram_bytes: int,
+) -> None:
+    operation = scheduled.operation
+    input_value, weight = operation.inputs
+    output = operation.output
+    _, _, _, input_c = input_value.type.shape
+    kernel_h, kernel_w, _, _ = weight.type.shape
+    stride_h, stride_w = operation.attributes["stride"]
+    pad_top, _, pad_left, _ = operation.attributes["padding"]
+    dilation_h, dilation_w = operation.attributes["dilation"]
+    effective_h = (kernel_h - 1) * dilation_h + 1
+    effective_w = (kernel_w - 1) * dilation_w + 1
+    tile_h = scheduled.loop("h").tile
+    tile_w = scheduled.loop("w").tile
+    tile_oc = scheduled.loop("oc").tile
+    tile_ic = scheduled.loop("ic").tile
+    n_size, output_h, output_w, output_c = output.type.shape
+
+    for n_offset in range(n_size):
+        for h_offset in range(0, output_h, tile_h):
+            h_extent = min(tile_h, output_h - h_offset)
+            input_h_extent = (h_extent - 1) * stride_h + effective_h
+            input_h_offset = h_offset * stride_h - pad_top
+            for w_offset in range(0, output_w, tile_w):
+                w_extent = min(tile_w, output_w - w_offset)
+                input_w_extent = (w_extent - 1) * stride_w + effective_w
+                input_w_offset = w_offset * stride_w - pad_left
+                for oc_offset in range(0, output_c, tile_oc):
+                    oc_extent = min(tile_oc, output_c - oc_offset)
+                    output_shape = (1, h_extent, w_extent, oc_extent)
+                    accumulator_shape = (h_extent * w_extent, oc_extent)
+                    max_ic_extent = min(tile_ic, input_c)
+                    max_input_shape = (
+                        1,
+                        input_h_extent,
+                        input_w_extent,
+                        max_ic_extent,
+                    )
+                    max_weight_shape = (
+                        kernel_h,
+                        kernel_w,
+                        max_ic_extent,
+                        oc_extent,
+                    )
+                    max_columns_shape = (
+                        h_extent * w_extent,
+                        kernel_h * kernel_w * max_ic_extent,
+                    )
+                    required = (
+                        _element_count(max_input_shape)
+                        + _element_count(max_weight_shape)
+                        + _element_count(max_columns_shape)
+                        + _element_count(accumulator_shape)
+                    ) * output.type.dtype.itemsize
+                    _require_sram(
+                        required,
+                        hardware,
+                        "im2col conv2d tile",
+                        reserved_sram_bytes,
+                    )
+                    instructions.append(
+                        Instruction(
+                            Opcode.ZERO,
+                            {"buffer": "acc", "shape": accumulator_shape},
+                        )
+                    )
+                    for ic_offset in range(0, input_c, tile_ic):
+                        ic_extent = min(tile_ic, input_c - ic_offset)
+                        input_shape = (
+                            1,
+                            input_h_extent,
+                            input_w_extent,
+                            ic_extent,
+                        )
+                        weight_shape = (
+                            kernel_h,
+                            kernel_w,
+                            ic_extent,
+                            oc_extent,
+                        )
+                        columns_shape = (
+                            h_extent * w_extent,
+                            kernel_h * kernel_w * ic_extent,
+                        )
+                        instructions.extend(
+                            (
+                                _load(
+                                    input_value.name,
+                                    "input",
+                                    (
+                                        n_offset,
+                                        input_h_offset,
+                                        input_w_offset,
+                                        ic_offset,
+                                    ),
+                                    input_shape,
+                                    padded=True,
+                                ),
+                                Instruction(
+                                    Opcode.IM2COL,
+                                    {
+                                        "input": "input",
+                                        "output": "lhs",
+                                        "kernel": (kernel_h, kernel_w),
+                                        "stride": (stride_h, stride_w),
+                                        "dilation": (dilation_h, dilation_w),
+                                        "output_shape": (h_extent, w_extent),
+                                    },
+                                ),
+                                _load(
+                                    weight.name,
+                                    "weight",
+                                    (0, 0, ic_offset, oc_offset),
+                                    weight_shape,
+                                ),
+                                Instruction(
+                                    Opcode.RESHAPE,
+                                    {
+                                        "input": "weight",
+                                        "output": "weight",
+                                        "shape": (
+                                            columns_shape[1],
+                                            oc_extent,
+                                        ),
+                                    },
+                                ),
+                                Instruction(
+                                    Opcode.MATMUL,
+                                    {
+                                        "lhs": "lhs",
+                                        "rhs": "weight",
+                                        "accumulator": "acc",
+                                    },
+                                ),
+                            )
+                        )
+                    instructions.extend(
+                        (
+                            Instruction(
+                                Opcode.RESHAPE,
+                                {
+                                    "input": "acc",
+                                    "output": "acc",
+                                    "shape": output_shape,
+                                },
+                            ),
+                            _store(
+                                "acc",
+                                output.name,
+                                (n_offset, h_offset, w_offset, oc_offset),
+                                output_shape,
+                            ),
                         )
                     )
 
